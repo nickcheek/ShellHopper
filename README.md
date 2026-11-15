@@ -4,9 +4,13 @@
   <img src="assets/ShellHopperIcon.png" width="180" alt="ShellHopper icon">
 </p>
 
-ShellHopper is a native macOS terminal for organizing SSH hosts and working across several servers without turning the terminal into a project-management system.
+<p align="center">
+  <strong>Your servers are organized. Your terminal should be too.</strong>
+</p>
 
-It uses your real shell and normal OpenSSH setup. There is no account, telemetry, cloud sync, subscription, or AI running in the app. It just helps you hop between shells. The frog jokes mostly stop there.
+ShellHopper is a native macOS terminal built for developers, administrators, and operators who manage more servers than a row of unlabeled terminal tabs can reasonably handle.
+
+It turns your existing OpenSSH configuration into a visual workspace: group hosts by environment or purpose, connect without hunting for aliases, run commands across selected servers, and keep every result in its own clearly named session. Your normal shell, keys, agent, aliases, and `ProxyJump` configuration keep working exactly where you expect them to.
 
 <p align="center">
   <img src="assets/ShellHopperScreenshot.png" alt="ShellHopper showing organized SSH host groups and the terminal context menu">
@@ -14,30 +18,107 @@ It uses your real shell and normal OpenSSH setup. There is no account, telemetry
 
 ## Download
 
-Download the latest signed and notarized DMG from [GitHub Releases](https://github.com/nickcheek/ShellHopper/releases). Open it, then drag ShellHopper into Applications.
+Download the latest signed and notarized universal DMG from [GitHub Releases](https://github.com/nickcheek/ShellHopper/releases). It supports Apple silicon and Intel Macs running macOS 13 or newer.
 
-## Features
+Open the DMG, then drag ShellHopper into Applications. No account or setup wizard is required.
 
-- Import hosts from `~/.ssh/config`, including aliases, keys, ports, agents, and `ProxyJump` settings.
-- Organize hosts into collapsible, reorderable groups with optional separators.
-- Open local or SSH sessions in tabs and recursively split panes right or down.
-- Select several hosts and run one command or multiline script in a managed tab for each server.
-- Save shared, single-line commands and paste them from a terminal's right-click menu. ShellHopper never presses Enter for you.
-- Open saved hosts from the macOS menu bar.
-- Drop local files onto a connected SSH pane to upload them to that host's home directory.
-- Search terminal output and the commands recorded for the current session.
-- Restore tab order, splits, host organization, and other safe interface state after restarting.
-- Use normal terminal behavior: truecolor, mouse reporting, alternate screens, bracketed paste, scrollback, selection, `vim`, `less`, and friends.
+## Built for server sprawl
 
-## Requirements
+ShellHopper is most useful when “just SSH into it” has become fifty aliases spread across development, staging, production, client environments, cloud accounts, and a home lab you definitely meant to document.
 
-- macOS
-- A current stable Rust toolchain when building from source
-- OpenSSH, included with macOS
+- **See the fleet before connecting.** Import `~/.ssh/config`, arrange hosts under collapsible headers, reorder them, and add separators where they help.
+- **Run one task across selected servers.** Select the hosts you need, enter a command or multiline script, and run it without manually opening every connection first.
+- **Keep output understandable.** Each server gets its own managed tab, and later commands reuse the correct session instead of creating tab number seventeen.
+- **Save the commands you actually repeat.** Shared saved commands are available from every terminal's right-click menu.
+- **Stay in control.** Choosing a saved command only pastes it. ShellHopper never presses Enter for you, so you can inspect or change it before anything runs.
+- **Use the SSH setup you already trust.** Keys, agents, aliases, ports, users, identity files, and jump hosts remain in OpenSSH rather than another proprietary vault.
 
-The optional local SSH fixture also requires Docker.
+## What makes ShellHopper different
+
+ShellHopper is not trying to replace the shell with a dashboard or turn terminal work into a cloud service. It adds organization around the terminal while keeping the terminal itself familiar.
+
+### Organized hosts, not memorized aliases
+
+Your SSH hosts live in a searchable sidebar with collapsible, reorderable groups. Organize them by environment, application, customer, cloud account, or whatever matches the way you actually think about the infrastructure.
+
+Double-click a host to open a managed SSH tab, connect the current pane from its context menu, or launch a saved host directly from the macOS menu bar.
+
+### Multi-server work without mixed output
+
+Select several hosts in the sidebar and send them one command or a multiline script. ShellHopper opens or reuses one managed tab per host, waits for each SSH connection to be ready, and keeps the output separated by server.
+
+That makes routine work—checking versions, inspecting service status, reviewing disk usage, or applying the same safe change across a group—faster without sacrificing visibility.
+
+### Saved commands with a safety catch
+
+Right-click any terminal and choose **Saved commands** to paste a shared command into that pane. Review it, edit it if needed, and press Enter when you are ready.
+
+Choose **Manage saved commands…** to add, rename, reorder, or remove commands. Entries are limited to one line so a saved command cannot conceal an embedded Enter.
+
+### A complete terminal, not a limited SSH console
+
+- Local login shells using your real shell configuration, including Oh My Zsh.
+- Tabs that can be renamed, reordered, reopened, or closed in groups.
+- Recursively nested split panes in either direction.
+- Truecolor, alternate screens, mouse reporting, bracketed paste, application cursor keys, and scrollback.
+- Proper support for interactive tools such as `vim`, `less`, history search, and terminal mouse applications.
+- Searchable terminal output and a command list for the current session.
+- Command-clickable URLs and local paths.
+
+### Practical Mac integration
+
+- Open or return to saved hosts from the menu bar.
+- Drop local files onto a connected SSH pane to upload them to that server's home directory.
+- Restore tab order, nested splits, host order, collapsed groups, and sidebar organization after restarting.
+- Reopen the last closed tab when “I definitely meant to close that” turns out to be inaccurate.
+
+## The basic workflow
+
+1. Launch ShellHopper and import the usable entries from `~/.ssh/config`.
+2. Arrange hosts into groups such as Development, Staging, Production, Clients, or Home Lab.
+3. Double-click one host for an interactive session, or select several hosts for a shared task.
+4. Enter a command or multiline script and choose **Run on selected hosts**.
+5. Review each server's output in its own tab and continue working in the open sessions.
+
+## Deliberately local
+
+ShellHopper has no account, subscription, telemetry, cloud sync, or AI running in the app. There is no separate credential store to maintain and no service that needs to remain available before you can reach your servers.
+
+It saves host organization, saved commands, and safe interface state here:
+
+```text
+~/Library/Application Support/ShellHopper/config.toml
+```
+
+It does **not** store passwords, terminal output, environment variables, SSH credentials, pending commands, or scrollback. Authentication remains with your SSH configuration, keys, agent, and interactive prompts.
+
+Saved commands are plain text. They are intended for repeatable shell commands—not passwords, tokens, or other secrets. Restored SSH panes start disconnected and reconnect only when you request it or send a multi-host command to that server.
+
+An existing TermiSlop configuration is copied into the new location on first launch, and the old file is left untouched.
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `⌘T` | Open a local terminal |
+| `⌘W` | Close the active pane or tab |
+| `⌘⇧T` | Reopen the last closed tab |
+| `⌘1`–`⌘8` | Switch to a numbered tab |
+| `⌘9` | Switch to the last tab |
+| `⌘⇧[` / `⌘⇧]` | Switch tabs |
+| `⌘F` | Search terminal output |
+| `⌘L` | Search, copy, or paste commands from the current session |
+| `⌘K` | Clear the active terminal and scrollback |
+| `⌘D` | Split the active pane right |
+| `⌘⇧D` | Split the active pane down |
+| `⌘↓` | Return to live output |
+| `⇧Page Up` / `⇧Page Down` | Move through scrollback |
+| `⌘` + click a URL or local path | Open it with the default macOS app |
+| Shift + drag | Select text when a terminal program owns the mouse |
 
 ## Build from source
+
+Building requires macOS and a current stable Rust toolchain.
 
 ```sh
 git clone https://github.com/nickcheek/ShellHopper.git
@@ -58,54 +139,6 @@ NOTARY_PROFILE="ShellHopper-notary" \
 
 The finished disk image is written to `dist/`. Signing requires a Developer ID Application certificate, and `NOTARY_PROFILE` must name credentials stored with `xcrun notarytool store-credentials`.
 
-## Using ShellHopper
-
-On first launch, ShellHopper imports usable entries from `~/.ssh/config`. You can also add hosts manually, reload the SSH config, reorganize hosts, or connect a pane to another saved host from its right-click menu.
-
-To work across several servers, select the hosts in the sidebar, enter a command or script, and choose **Run on selected hosts**. ShellHopper opens or reuses one managed tab per host so each server's output stays separate.
-
-### Saved commands
-
-Right-click a terminal and choose **Saved commands** to paste a saved command into that pane. Review or edit it, then press Enter yourself.
-
-Choose **Manage saved commands…** from the same menu to add, rename, reorder, or remove commands. Saved commands are shared across all hosts and are limited to one line so selecting one cannot hide an embedded Enter.
-
-### Keyboard shortcuts
-
-| Shortcut | Action |
-| --- | --- |
-| `⌘T` | Open a local terminal |
-| `⌘W` | Close the active pane or tab |
-| `⌘⇧T` | Reopen the last closed tab |
-| `⌘1`–`⌘8` | Switch to a numbered tab |
-| `⌘9` | Switch to the last tab |
-| `⌘⇧[` / `⌘⇧]` | Switch tabs |
-| `⌘F` | Search terminal output |
-| `⌘L` | Search, copy, or paste commands from the current session |
-| `⌘K` | Clear the active terminal and scrollback |
-| `⌘D` | Split the active pane right |
-| `⌘⇧D` | Split the active pane down |
-| `⌘↓` | Return to live output |
-| `⇧Page Up` / `⇧Page Down` | Move through scrollback |
-| `⌘` + click a URL or local path | Open it with the default macOS app |
-| Shift + drag | Select text when a terminal program owns the mouse |
-
-## Configuration and privacy
-
-ShellHopper stores its configuration here:
-
-```text
-~/Library/Application Support/ShellHopper/config.toml
-```
-
-An existing TermiSlop configuration is copied into this location the first time ShellHopper starts. The old file is left untouched.
-
-The configuration contains host organization, saved commands, and interface state. It does not store passwords, terminal output, environment variables, SSH credentials, pending commands, or scrollback. Authentication remains with your SSH config, keys, agent, and interactive prompts.
-
-Saved commands are plain text. Treat the list like a shell script: commands belong there; passwords and tokens do not.
-
-Restored SSH panes start disconnected and reconnect only when you ask them to or send a multi-host command to that server.
-
 ## Local SSH fixture
 
 The opt-in Docker/OpenSSH fixture under [`tests/fixtures/ssh`](tests/fixtures/ssh/README.md) binds to a random loopback port and creates disposable keys and configuration under `/tmp`. It does not modify your real SSH config or `known_hosts` file.
@@ -117,7 +150,7 @@ The opt-in Docker/OpenSSH fixture under [`tests/fixtures/ssh`](tests/fixtures/ss
 
 ## Contributing
 
-Bug reports should include what you did, what you expected, what happened, and enough detail to reproduce it. Small pull requests that solve one real problem are much easier to review than ambitious plans to reinvent the terminal.
+Bug reports should include what you did, what you expected, what happened, and enough detail to reproduce it. Screenshots and exact SSH configuration relationships are especially helpful. Small pull requests that solve one real problem are much easier to review than ambitious plans to reinvent the terminal.
 
 ## License
 
