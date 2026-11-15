@@ -29,6 +29,7 @@ ShellHopper is most useful when “just SSH into it” has become fifty aliases 
 - **See the fleet before connecting.** Import `~/.ssh/config`, arrange hosts under collapsible headers, reorder them, and add separators where they help.
 - **Run one task across selected servers.** Select the hosts you need, enter a command or multiline script, and run it without manually opening every connection first.
 - **Keep output understandable.** Each server gets its own managed tab, and later commands reuse the correct session instead of creating tab number seventeen.
+- **Build the workspace you need.** Keep servers in reorderable tabs, split any pane right or down, and nest additional splits to watch or operate several sessions at once.
 - **Save the commands you actually repeat.** Shared saved commands are available from every terminal's right-click menu.
 - **Stay in control.** Choosing a saved command only pastes it. ShellHopper never presses Enter for you, so you can inspect or change it before anything runs.
 - **Use the SSH setup you already trust.** Keys, agents, aliases, ports, users, identity files, and jump hosts remain in OpenSSH rather than another proprietary vault.
@@ -49,6 +50,14 @@ Select several hosts in the sidebar and send them one command or a multiline scr
 
 That makes routine work—checking versions, inspecting service status, reviewing disk usage, or applying the same safe change across a group—faster without sacrificing visibility.
 
+### Tabs and split panes built for real operations
+
+Every local or SSH session can live in its own named tab, and tabs can be reordered, renamed, reopened, or closed in groups. When you need several sessions visible together, split any terminal pane to the right or downward.
+
+Splits are fully nestable, so one tab can hold the exact working layout you need: production beside staging, a log stream above a command shell, or several related servers visible at the same time. Each pane remains an independent terminal and can connect to a different saved host from its right-click menu.
+
+ShellHopper restores the tab order and complete nested split layout after restarting, while restored SSH panes remain safely disconnected until you choose to reconnect them.
+
 ### Saved commands with a safety catch
 
 Right-click any terminal and choose **Saved commands** to paste a shared command into that pane. Review it, edit it if needed, and press Enter when you are ready.
@@ -58,8 +67,7 @@ Choose **Manage saved commands…** to add, rename, reorder, or remove commands.
 ### A complete terminal, not a limited SSH console
 
 - Local login shells using your real shell configuration, including Oh My Zsh.
-- Tabs that can be renamed, reordered, reopened, or closed in groups.
-- Recursively nested split panes in either direction.
+- Tabs and recursively nested split panes that preserve independent terminal sessions.
 - Truecolor, alternate screens, mouse reporting, bracketed paste, application cursor keys, and scrollback.
 - Proper support for interactive tools such as `vim`, `less`, history search, and terminal mouse applications.
 - Searchable terminal output and a command list for the current session.
