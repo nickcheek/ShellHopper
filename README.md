@@ -8,6 +8,10 @@ ShellHopper is a native macOS terminal for organizing SSH hosts and working acro
 
 It uses your real shell and normal OpenSSH setup. There is no account, telemetry, cloud sync, subscription, or AI running in the app. It just helps you hop between shells. The frog jokes mostly stop there.
 
+<p align="center">
+  <img src="assets/ShellHopperScreenshot.png" alt="ShellHopper showing organized SSH host groups and the terminal context menu">
+</p>
+
 ## Download
 
 Download the latest signed and notarized DMG from [GitHub Releases](https://github.com/nickcheek/ShellHopper/releases). Open it, then drag ShellHopper into Applications.
