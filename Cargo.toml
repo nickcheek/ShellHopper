@@ -1,0 +1,23 @@
+[package]
+name = "shellhopper"
+version = "0.1.0"
+edition = "2024"
+description = "A native macOS terminal for organized SSH workflows"
+license = "MIT"
+
+[dependencies]
+eframe = "0.36.2"
+portable-pty = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+vt100 = "0.16"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.3"
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSButton", "NSControl", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView"] }
+objc2-foundation = { version = "0.2.2", features = ["NSObject", "NSString"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+

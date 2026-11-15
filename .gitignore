@@ -1,0 +1,13 @@
+# Rust and release output
+/target/
+/dist/
+*.app/
+*.dmg
+*.pkg
+
+# Ignore hidden files and folders everywhere unless they are repository metadata.
+.*
+!.gitignore
+!.github/
+!.github/**
+
