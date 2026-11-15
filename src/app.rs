@@ -955,6 +955,10 @@ impl ShellHopperApp {
         match action {
             MenuBarAction::Show => {}
             MenuBarAction::NewLocal => self.open_local(),
+            MenuBarAction::Quit => {
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
             MenuBarAction::OpenHost(name) => {
                 let existing = self
                     .sessions
@@ -990,6 +994,8 @@ impl ShellHopperApp {
         MenuBar::activate_app();
         self.ctx
             .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        self.ctx
+            .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 

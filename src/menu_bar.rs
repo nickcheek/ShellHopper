@@ -14,6 +14,7 @@ pub enum MenuBarAction {
     Show,
     NewLocal,
     OpenHost(String),
+    Quit,
 }
 
 #[derive(Debug)]
@@ -40,6 +41,7 @@ declare_class!(
     unsafe impl MenuTarget {
         #[method(openSession:)]
         fn open_session(&self, item: &NSMenuItem) {
+            MenuBar::activate_app();
             let _ = self.ivars().sender.send(unsafe { item.tag() });
             self.ivars().ctx.request_repaint();
         }
@@ -137,6 +139,10 @@ impl MenuBar {
             group_item.setSubmenu(Some(&submenu));
             self.menu.addItem(&group_item);
         }
+
+        self.menu
+            .addItem(&NSMenuItem::separatorItem(MainThreadMarker::new().unwrap()));
+        self.add_action("Quit ShellHopper", MenuBarAction::Quit);
     }
 
     pub fn next_action(&self) -> Option<MenuBarAction> {
@@ -146,7 +152,16 @@ impl MenuBar {
 
     pub fn activate_app() {
         let mtm = MainThreadMarker::new().expect("menu actions run on the main thread");
-        unsafe { NSApplication::sharedApplication(mtm).activate() };
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe { app.unhide(None) };
+        for window in app.windows().iter() {
+            if window.isMiniaturized() {
+                unsafe { window.deminiaturize(None) };
+            }
+            window.makeKeyAndOrderFront(None);
+        }
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 
     fn add_action(&mut self, title: &str, action: MenuBarAction) {
