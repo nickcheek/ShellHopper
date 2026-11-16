@@ -1,6 +1,6 @@
 [package]
 name = "shellhopper"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A native macOS terminal for organized SSH workflows"
 license = "MIT"

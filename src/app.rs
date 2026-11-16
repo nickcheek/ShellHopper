@@ -1521,17 +1521,23 @@ impl ShellHopperApp {
                                         .active_session
                                         .is_some_and(|active| self.tab_root(active) == id);
                                     let (status_color, status_label) = tab_status(session);
-                                    let tab = theme::tab(
-                                        ui,
-                                        &session.title,
-                                        selected,
-                                        true,
-                                        status_color,
+                                    let source = ui.dnd_drag_source(
+                                        ui.id().with(("terminal-tab", session.id)),
+                                        DraggedTab(session.id),
+                                        |ui| {
+                                            theme::tab(
+                                                ui,
+                                                &session.title,
+                                                selected,
+                                                true,
+                                                status_color,
+                                            )
+                                        },
                                     );
+                                    let tab = source.inner;
                                     tab.response.clone().on_hover_text(status_label);
-                                    tab.response.dnd_set_drag_payload(DraggedTab(session.id));
                                     if let Some(dragged) =
-                                        tab.response.dnd_hover_payload::<DraggedTab>()
+                                        source.response.dnd_hover_payload::<DraggedTab>()
                                         && dragged.0 != session.id
                                     {
                                         let after = ui.input(|input| {
@@ -1551,9 +1557,7 @@ impl ShellHopperApp {
                                             ],
                                             Stroke::new(2.0, theme::ACCENT),
                                         );
-                                        if let Some(dragged) =
-                                            tab.response.dnd_release_payload::<DraggedTab>()
-                                        {
+                                        if ui.input(|input| input.pointer.primary_down()) {
                                             reorder = Some((dragged.0, session.id, after));
                                         }
                                     }
