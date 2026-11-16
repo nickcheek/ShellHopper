@@ -1659,13 +1659,17 @@ impl ShellHopperApp {
                     new_tab = theme::new_tab_button(ui)
                         .on_hover_text("New local terminal")
                         .clicked();
-                    if let Some(version) = &update_version {
-                        let label = format!("Update to v{version}");
-                        update = ui
-                            .add(theme::secondary_button(&label, 128.0))
-                            .on_hover_text("Restart ShellHopper and install the verified update")
-                            .clicked();
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(version) = &update_version {
+                            let label = format!("Update to v{version}");
+                            update = ui
+                                .add(theme::secondary_button(&label, 128.0))
+                                .on_hover_text(
+                                    "Restart ShellHopper and install the verified update",
+                                )
+                                .clicked();
+                        }
+                    });
                 });
 
                 #[cfg(target_os = "macos")]
