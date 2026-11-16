@@ -25,6 +25,10 @@ use crate::{
         TITLEBAR_HEIGHT,
     },
 };
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSApplication;
+#[cfg(target_os = "macos")]
+use objc2_foundation::MainThreadMarker;
 
 /// Output chunks (8 KB each) parsed per frame across every session.
 const FRAME_CHUNK_BUDGET: usize = 256;
@@ -41,6 +45,7 @@ pub struct ShellHopperApp {
     active_session: Option<u64>,
     terminal_focus: Option<u64>,
     terminal_selection: Option<TerminalSelection>,
+    dragged_tab: Option<u64>,
     next_session_id: u64,
     next_split_id: u64,
     /// Which session gets first call on the next frame's output budget.
@@ -73,6 +78,8 @@ pub struct ShellHopperApp {
     menu_bar: MenuBar,
     #[cfg(target_os = "macos")]
     updater: Updater,
+    #[cfg(target_os = "macos")]
+    native_window_configured: bool,
 }
 
 #[derive(Default)]
@@ -90,9 +97,6 @@ struct TabRename {
 
 #[derive(Clone)]
 struct DraggedGroup(String);
-
-#[derive(Clone)]
-struct DraggedTab(u64);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TerminalPoint {
@@ -323,6 +327,21 @@ fn tab_status(session: &TerminalSession) -> (Color32, &'static str) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn disable_native_titlebar_dragging() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app.keyWindow().or_else(|| unsafe { app.mainWindow() });
+    if let Some(window) = window {
+        window.setMovable(false);
+        true
+    } else {
+        false
+    }
+}
+
 fn reorder_session(
     sessions: &mut Vec<TerminalSession>,
     dragged: u64,
@@ -400,6 +419,7 @@ impl ShellHopperApp {
             active_session: None,
             terminal_focus: None,
             terminal_selection: None,
+            dragged_tab: None,
             next_session_id: 1,
             next_split_id: 1,
             poll_start: 0,
@@ -431,6 +451,8 @@ impl ShellHopperApp {
             menu_bar,
             #[cfg(target_os = "macos")]
             updater,
+            #[cfg(target_os = "macos")]
+            native_window_configured: false,
         };
         app.restore_saved_tabs();
         if let Some(kind) = startup_import {
@@ -1520,10 +1542,8 @@ impl ShellHopperApp {
                                         .active_session
                                         .is_some_and(|active| self.tab_root(active) == id);
                                     let (status_color, status_label) = tab_status(session);
-                                    let source = ui.dnd_drag_source(
-                                        ui.id().with(("terminal-tab", session.id)),
-                                        DraggedTab(session.id),
-                                        |ui| {
+                                    let tab = ui
+                                        .push_id(("terminal-tab", session.id), |ui| {
                                             theme::tab(
                                                 ui,
                                                 &session.title,
@@ -1531,13 +1551,23 @@ impl ShellHopperApp {
                                                 true,
                                                 status_color,
                                             )
-                                        },
-                                    );
-                                    let tab = source.inner;
-                                    tab.response.clone().on_hover_text(status_label);
-                                    if let Some(dragged) =
-                                        source.response.dnd_hover_payload::<DraggedTab>()
-                                        && dragged.0 != session.id
+                                        })
+                                        .inner;
+                                    tab.response
+                                        .clone()
+                                        .on_hover_cursor(egui::CursorIcon::Grab)
+                                        .on_hover_text(status_label);
+                                    if tab.response.drag_started_by(egui::PointerButton::Primary) {
+                                        self.dragged_tab = Some(session.id);
+                                    }
+                                    if let Some(dragged) = self.dragged_tab
+                                        && dragged != session.id
+                                        && ui.input(|input| input.pointer.primary_down())
+                                        && ui.input(|input| {
+                                            input.pointer.hover_pos().is_some_and(|position| {
+                                                tab.response.rect.contains(position)
+                                            })
+                                        })
                                     {
                                         let after = ui.input(|input| {
                                             input.pointer.hover_pos().is_some_and(|position| {
@@ -1556,9 +1586,7 @@ impl ShellHopperApp {
                                             ],
                                             Stroke::new(2.0, theme::ACCENT),
                                         );
-                                        if ui.input(|input| input.pointer.primary_down()) {
-                                            reorder = Some((dragged.0, session.id, after));
-                                        }
+                                        reorder = Some((dragged, session.id, after));
                                     }
                                     tab.response.context_menu(|ui| {
                                         if ui.button("Rename tab…").clicked() {
@@ -1684,6 +1712,9 @@ impl ShellHopperApp {
                         ),
                         "titlebar",
                     );
+                }
+                if !ui.input(|input| input.pointer.primary_down()) {
+                    self.dragged_tab = None;
                 }
 
                 #[cfg(target_os = "macos")]
@@ -3152,6 +3183,10 @@ fn saved_pane_layout(layout: &PaneLayout, sessions: &[TerminalSession]) -> Optio
 impl eframe::App for ShellHopperApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        #[cfg(target_os = "macos")]
+        if !self.native_window_configured {
+            self.native_window_configured = disable_native_titlebar_dragging();
+        }
         self.poll();
         if ctx.input(|input| input.viewport().close_requested())
             && !self.quit_confirmed

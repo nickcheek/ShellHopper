@@ -399,7 +399,7 @@ pub fn tab(
     let status_space = 14.0;
     let close_space = if closable { 22.0 } else { 0.0 };
     let width = (12.0 + status_space + text_width + close_space + 12.0).max(72.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click_and_drag());
     response
         .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, title));
     let hovered = ui.rect_contains_pointer(rect);
