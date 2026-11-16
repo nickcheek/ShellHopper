@@ -242,6 +242,66 @@ impl TerminalSession {
         self.parser.screen().scrollback()
     }
 
+    pub fn history_rows(&mut self) -> usize {
+        let original = self.scrollback();
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let rows = screen.scrollback();
+        screen.set_scrollback(original);
+        rows
+    }
+
+    pub fn selection_text(
+        &mut self,
+        start_row: usize,
+        start_col: u16,
+        end_row: usize,
+        end_col: u16,
+    ) -> String {
+        let original = self.scrollback();
+        let history_rows = self.history_rows();
+        let (screen_rows, cols) = self.screen().size();
+        let total_rows = history_rows + usize::from(screen_rows);
+        if start_row >= total_rows
+            || end_row >= total_rows
+            || (start_row, start_col) >= (end_row, end_col)
+        {
+            return String::new();
+        }
+
+        let mut text = String::new();
+        let last_row = if end_col == 0 && end_row > start_row {
+            end_row - 1
+        } else {
+            end_row
+        };
+        for row in start_row..=last_row {
+            let (offset, visible_row) = if row < history_rows {
+                (history_rows - row, 0)
+            } else {
+                (0, (row - history_rows) as u16)
+            };
+            let screen = self.parser.screen_mut();
+            screen.set_scrollback(offset);
+            let from = if row == start_row {
+                start_col.min(cols)
+            } else {
+                0
+            };
+            let to = if row == end_row {
+                end_col.min(cols)
+            } else {
+                cols
+            };
+            text.push_str(&screen.contents_between(visible_row, from, visible_row, to));
+            if row < end_row && !screen.row_wrapped(visible_row) {
+                text.push('\n');
+            }
+        }
+        self.parser.screen_mut().set_scrollback(original);
+        text
+    }
+
     pub fn scroll_lines(&mut self, lines: isize) {
         let current = self.scrollback();
         let target = if lines.is_positive() {
@@ -763,6 +823,15 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn copies_text_between_terminal_cells() {
+        let mut session =
+            TerminalSession::restored_ssh(1, &SshHost::default(), &Context::default());
+        session.parser.process(b"alpha\r\nbeta");
+
+        assert_eq!(session.selection_text(0, 1, 1, 3), "lpha\nbet");
+    }
 
     #[test]
     fn ssh_starts_a_plain_login_session() {

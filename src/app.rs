@@ -38,7 +38,7 @@ pub struct ShellHopperApp {
     splits: BTreeMap<u64, PaneLayout>,
     active_session: Option<u64>,
     terminal_focus: Option<u64>,
-    terminal_selection: Option<(u64, LayoutJob)>,
+    terminal_selection: Option<TerminalSelection>,
     next_session_id: u64,
     next_split_id: u64,
     /// Which session gets first call on the next frame's output budget.
@@ -87,6 +87,41 @@ struct DraggedGroup(String);
 
 #[derive(Clone)]
 struct DraggedTab(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TerminalPoint {
+    row: usize,
+    col: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalSelection {
+    session_id: u64,
+    anchor: TerminalPoint,
+    head: TerminalPoint,
+    cols: u16,
+    dragging: bool,
+}
+
+impl TerminalSelection {
+    fn range(self) -> (TerminalPoint, TerminalPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn has_text(self) -> bool {
+        self.anchor != self.head
+    }
+
+    fn contains(self, row: usize, col: u16) -> bool {
+        let (start, end) = self.range();
+        let cell = TerminalPoint { row, col };
+        start <= cell && cell < end
+    }
+}
 
 struct ClosedTab {
     descriptor: SavedTab,
@@ -616,6 +651,12 @@ impl ShellHopperApp {
         let root_index = self.sessions.iter().position(|session| session.id == root);
         let (layout, focus) = layout.remove_leaf(id);
         self.sessions.retain(|session| session.id != id);
+        if self
+            .terminal_selection
+            .is_some_and(|selection| selection.session_id == id)
+        {
+            self.terminal_selection = None;
+        }
         let Some(layout) = layout else {
             self.close_session(root);
             return;
@@ -709,6 +750,12 @@ impl ShellHopperApp {
         }
         self.sessions
             .retain(|session| !pane_ids.contains(&session.id));
+        if self
+            .terminal_selection
+            .is_some_and(|selection| pane_ids.contains(&selection.session_id))
+        {
+            self.terminal_selection = None;
+        }
         self.closed_tabs.push(ClosedTab {
             descriptor,
             title,
@@ -1981,23 +2028,19 @@ impl ShellHopperApp {
             .clamp(2.0, u16::MAX as f32) as u16;
         session.resize(rows, cols);
 
-        let has_selection = ctx
-            .plugin::<egui::text_selection::LabelSelectionState>()
-            .lock()
-            .has_selection();
-        if !has_selection {
+        if self
+            .terminal_selection
+            .is_some_and(|selection| selection.session_id == id && selection.cols != cols)
+        {
             self.terminal_selection = None;
         }
-        // Keep scrolling output from replacing the text under an active selection.
-        let terminal = self
+        let history_rows = session.history_rows();
+        let selection = self
             .terminal_selection
             .as_ref()
-            .filter(|(selected_id, _)| has_selection && *selected_id == id)
-            .map(|(_, terminal)| terminal.clone())
-            .unwrap_or_else(|| terminal_layout(session.screen(), search.as_deref()));
-        let terminal_snapshot = ctx
-            .input(|input| input.pointer.primary_down())
-            .then(|| terminal.clone());
+            .filter(|selection| selection.session_id == id);
+        let terminal =
+            terminal_layout(session.screen(), search.as_deref(), history_rows, selection);
         let screen = session.screen();
         let application_cursor = screen.application_cursor();
         let bracketed_paste = screen.bracketed_paste();
@@ -2007,41 +2050,33 @@ impl ShellHopperApp {
             && screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
         let shift_held = ctx.input(|input| input.modifiers.shift);
         let terminal_selectable = !sgr_mouse || shift_held;
-        let scroll_source = if alternate_screen || sgr_mouse {
-            egui::scroll_area::ScrollSource::NONE
-        } else {
-            egui::scroll_area::ScrollSource::default()
-        };
         let mut activated = false;
         let mut connect_host = None;
         let mut reconnect = false;
         let mut split = None;
         let mut close = false;
+        let mut copy_selection = false;
         let mut paste_from_clipboard = false;
         let mut paste_saved_command = None;
         let mut manage_saved_commands = false;
         let mut open_error = None;
         let mut dropped_paths = Vec::new();
-        let mut selecting_terminal = false;
         let reconnectable =
             session.host_name().is_some() && session.state() == SessionState::Disconnected;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .scroll_source(scroll_source)
+            .scroll_source(egui::scroll_area::ScrollSource::NONE)
             .show(ui, |ui| {
                 let response = ui
                     .push_id(("terminal", id), |ui| {
                         ui.add(
                             egui::Label::new(terminal)
-                                .selectable(terminal_selectable)
+                                .selectable(false)
                                 .sense(Sense::click_and_drag())
                                 .wrap_mode(egui::TextWrapMode::Extend),
                         )
                     })
                     .inner;
-                selecting_terminal = terminal_selectable
-                    && response.is_pointer_button_down_on()
-                    && ctx.input(|input| input.pointer.primary_down());
                 let input_state = TerminalInputState {
                     rect: response.rect,
                     cell_width,
@@ -2054,6 +2089,86 @@ impl ShellHopperApp {
                     mouse_mode,
                     sgr_mouse,
                 };
+                let selection_start = ctx.input(|input| {
+                    input.events.iter().find_map(|event| match event {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers,
+                        } if terminal_selectable
+                            && !modifiers.command
+                            && response.rect.contains(*pos) =>
+                        {
+                            Some(*pos)
+                        }
+                        _ => None,
+                    })
+                });
+                if let Some(position) = selection_start {
+                    let point = terminal_selection_point(
+                        position,
+                        input_state,
+                        history_rows,
+                        session.scrollback(),
+                    );
+                    self.terminal_selection = Some(TerminalSelection {
+                        session_id: id,
+                        anchor: point,
+                        head: point,
+                        cols,
+                        dragging: true,
+                    });
+                    ctx.request_repaint();
+                }
+                if self
+                    .terminal_selection
+                    .is_some_and(|selection| selection.session_id == id && selection.dragging)
+                {
+                    let (position, primary_down) = ctx.input(|input| {
+                        (input.pointer.interact_pos(), input.pointer.primary_down())
+                    });
+                    if primary_down {
+                        if let Some(position) = position {
+                            let lines = if position.y < response.rect.top() {
+                                ((response.rect.top() - position.y) / row_height)
+                                    .ceil()
+                                    .clamp(1.0, 6.0) as isize
+                            } else if position.y > response.rect.bottom() {
+                                -((position.y - response.rect.bottom()) / row_height)
+                                    .ceil()
+                                    .clamp(1.0, 6.0) as isize
+                            } else {
+                                0
+                            };
+                            if lines != 0 && !alternate_screen {
+                                session.scroll_lines(lines);
+                            }
+                            let history_rows = session.history_rows();
+                            let point = terminal_selection_point(
+                                position,
+                                input_state,
+                                history_rows,
+                                session.scrollback(),
+                            );
+                            let mut changed = false;
+                            if let Some(selection) = self.terminal_selection.as_mut() {
+                                if selection.head != point {
+                                    selection.head = point;
+                                    changed = true;
+                                }
+                            }
+                            if lines != 0 || changed {
+                                ctx.request_repaint();
+                            }
+                        }
+                    } else if let Some(selection) = self.terminal_selection.as_mut() {
+                        selection.dragging = false;
+                        if !selection.has_text() {
+                            self.terminal_selection = None;
+                        }
+                    }
+                }
                 let command_held = ctx.input(|input| input.modifiers.command);
                 let hovered_target = command_held
                     .then(|| response.hover_pos())
@@ -2126,6 +2241,16 @@ impl ShellHopperApp {
                     }
                 }
                 response.context_menu(|ui| {
+                    let can_copy = self.terminal_selection.is_some_and(|selection| {
+                        selection.session_id == id && selection.has_text()
+                    });
+                    if ui
+                        .add_enabled(can_copy, egui::Button::new("Copy     ⌘C"))
+                        .clicked()
+                    {
+                        copy_selection = true;
+                        ui.close();
+                    }
                     if ui.button("Paste    ⌘V").clicked() {
                         paste_from_clipboard = true;
                         ui.close();
@@ -2230,11 +2355,24 @@ impl ShellHopperApp {
                             },
                         );
                     });
+                    if ctx.input(|input| {
+                        input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::Copy))
+                    }) {
+                        copy_selection = true;
+                    }
                     handle_terminal_input(ctx, session, input_state);
                 }
             });
-        if selecting_terminal {
-            self.terminal_selection = terminal_snapshot.map(|terminal| (id, terminal));
+        if copy_selection
+            && let Some(selection) = self
+                .terminal_selection
+                .filter(|selection| selection.session_id == id && selection.has_text())
+        {
+            let (start, end) = selection.range();
+            ctx.copy_text(session.selection_text(start.row, start.col, end.row, end.col));
         }
         if paste_from_clipboard {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
@@ -3360,6 +3498,23 @@ fn terminal_cell(pos: egui::Pos2, state: TerminalInputState) -> Option<(u16, u16
     Some((col.clamp(1, state.cols), row.clamp(1, state.rows)))
 }
 
+fn terminal_selection_point(
+    pos: egui::Pos2,
+    state: TerminalInputState,
+    history_rows: usize,
+    scrollback: usize,
+) -> TerminalPoint {
+    let x = (pos.x - state.rect.left()).clamp(0.0, state.cell_width * f32::from(state.cols));
+    let col = (x / state.cell_width).round() as u16;
+    let row = ((pos.y - state.rect.top()) / state.row_height)
+        .floor()
+        .clamp(0.0, f32::from(state.rows.saturating_sub(1))) as usize;
+    TerminalPoint {
+        row: history_rows.saturating_sub(scrollback) + row,
+        col: col.min(state.cols),
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum TerminalOpenTarget {
     Url(String),
@@ -3537,7 +3692,12 @@ fn control_byte(key: Key) -> Option<u8> {
     Some(letter & 0x1f)
 }
 
-fn terminal_layout(screen: &vt100::Screen, search: Option<&str>) -> LayoutJob {
+fn terminal_layout(
+    screen: &vt100::Screen,
+    search: Option<&str>,
+    history_rows: usize,
+    selection: Option<&TerminalSelection>,
+) -> LayoutJob {
     let (rows, cols) = screen.size();
     let cursor = screen.cursor_position();
     let mut job = LayoutJob::default();
@@ -3545,6 +3705,7 @@ fn terminal_layout(screen: &vt100::Screen, search: Option<&str>) -> LayoutJob {
     job.keep_trailing_whitespace = true;
     let mut run = String::new();
     let mut run_format = None;
+    let first_row = history_rows.saturating_sub(screen.scrollback());
 
     for row in 0..rows {
         let search_matches = search
@@ -3577,6 +3738,12 @@ fn terminal_layout(screen: &vt100::Screen, search: Option<&str>) -> LayoutJob {
             {
                 foreground = Color32::from_rgb(26, 29, 36);
                 background = Color32::from_rgb(234, 190, 78);
+            }
+            if selection
+                .is_some_and(|selection| selection.contains(first_row + usize::from(row), col))
+            {
+                foreground = Color32::WHITE;
+                background = Color32::from_rgb(50, 96, 151);
             }
 
             let format = TextFormat {
@@ -3779,6 +3946,27 @@ mod terminal_color_tests {
         assert!(matches[..5].iter().all(|matched| *matched));
         assert!(matches[11..16].iter().all(|matched| *matched));
         assert!(matches[5..11].iter().all(|matched| !matched));
+    }
+
+    #[test]
+    fn terminal_selection_normalizes_backwards_drags() {
+        let selection = TerminalSelection {
+            session_id: 1,
+            anchor: TerminalPoint { row: 4, col: 8 },
+            head: TerminalPoint { row: 2, col: 3 },
+            cols: 80,
+            dragging: false,
+        };
+
+        assert_eq!(
+            selection.range(),
+            (
+                TerminalPoint { row: 2, col: 3 },
+                TerminalPoint { row: 4, col: 8 }
+            )
+        );
+        assert!(selection.contains(3, 0));
+        assert!(!selection.contains(4, 8));
     }
 
     #[test]
