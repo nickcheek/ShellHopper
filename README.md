@@ -145,7 +145,7 @@ NOTARY_PROFILE="ShellHopper-notary" \
 ./scripts/package-macos.sh
 ```
 
-The finished disk image is written to `dist/`. Signing requires a Developer ID Application certificate, and `NOTARY_PROFILE` must name credentials stored with `xcrun notarytool store-credentials`.
+The finished disk image and its SHA-256 checksum are written to `dist/`. Upload both files to the GitHub release so installed copies can verify and download the update. Signing requires a Developer ID Application certificate, and `NOTARY_PROFILE` must name credentials stored with `xcrun notarytool store-credentials`.
 
 ## Local SSH fixture
 

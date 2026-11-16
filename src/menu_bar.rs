@@ -13,6 +13,7 @@ use crate::config::AppConfig;
 pub enum MenuBarAction {
     Show,
     NewLocal,
+    CheckForUpdates,
     OpenHost(String),
     Quit,
 }
@@ -104,6 +105,7 @@ impl MenuBar {
 
         self.add_action("Show ShellHopper", MenuBarAction::Show);
         self.add_action("New Local Terminal", MenuBarAction::NewLocal);
+        self.add_action("Check for Updates…", MenuBarAction::CheckForUpdates);
         self.menu
             .addItem(&NSMenuItem::separatorItem(MainThreadMarker::new().unwrap()));
 

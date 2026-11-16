@@ -13,6 +13,7 @@ dist="$root/dist"
 app="$dist/ShellHopper.app"
 dmg_root="$dist/dmg"
 dmg="$dist/ShellHopper-$version.dmg"
+checksum="$dmg.sha256"
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     rustup target list --installed | grep -qx "$target" || {
@@ -24,7 +25,7 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
 done
 
 rm -rf -- "$app" "$dmg_root"
-rm -f -- "$dmg"
+rm -f -- "$dmg" "$checksum"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$dmg_root"
 
 lipo -create \
@@ -62,4 +63,7 @@ xcrun stapler staple "$dmg"
 xcrun stapler validate "$dmg"
 spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
 
+(cd "$dist" && shasum -a 256 "$(basename "$dmg")" > "$(basename "$checksum")")
+
 echo "Created $dmg"
+echo "Created $checksum"

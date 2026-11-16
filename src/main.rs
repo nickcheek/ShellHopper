@@ -4,6 +4,8 @@ mod config;
 mod menu_bar;
 mod terminal;
 mod theme;
+#[cfg(target_os = "macos")]
+mod updater;
 
 use app::ShellHopperApp;
 

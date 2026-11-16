@@ -12,6 +12,8 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use crate::menu_bar::{MenuBar, MenuBarAction};
+#[cfg(target_os = "macos")]
+use crate::updater::{UpdateNotice, Updater};
 use crate::{
     config::{
         AppConfig, ImportKind, SavedCommand, SavedSplitDirection, SavedTab, SshHost,
@@ -64,9 +66,13 @@ pub struct ShellHopperApp {
     file_drop_target: Option<u64>,
     closed_tabs: Vec<ClosedTab>,
     show_quit_confirmation: bool,
+    #[cfg(target_os = "macos")]
+    show_update_confirmation: bool,
     quit_confirmed: bool,
     #[cfg(target_os = "macos")]
     menu_bar: MenuBar,
+    #[cfg(target_os = "macos")]
+    updater: Updater,
 }
 
 #[derive(Default)]
@@ -379,6 +385,10 @@ impl ShellHopperApp {
             .unwrap_or_else(|| "SSH Config".into());
         #[cfg(target_os = "macos")]
         let menu_bar = MenuBar::new(&config, &cc.egui_ctx);
+        #[cfg(target_os = "macos")]
+        let mut updater = Updater::new(&cc.egui_ctx);
+        #[cfg(target_os = "macos")]
+        updater.check(false);
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
             config_writable: message.is_none(),
@@ -414,9 +424,13 @@ impl ShellHopperApp {
             file_drop_target: None,
             closed_tabs: Vec::new(),
             show_quit_confirmation: false,
+            #[cfg(target_os = "macos")]
+            show_update_confirmation: false,
             quit_confirmed: false,
             #[cfg(target_os = "macos")]
             menu_bar,
+            #[cfg(target_os = "macos")]
+            updater,
         };
         app.restore_saved_tabs();
         if let Some(kind) = startup_import {
@@ -913,6 +927,16 @@ impl ShellHopperApp {
         while let Some(action) = self.menu_bar.next_action() {
             self.handle_menu_bar_action(action);
         }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(notice) = self.updater.poll() {
+                self.message = Some(match notice {
+                    UpdateNotice::Current => "ShellHopper is up to date.".into(),
+                    UpdateNotice::Failed(error) => error,
+                });
+            }
+            self.updater.check_if_due();
+        }
 
         // One budget for all tabs keeps a frame bounded however many are noisy;
         // rotating the starting tab stops the first ones from starving the rest.
@@ -1004,6 +1028,7 @@ impl ShellHopperApp {
         match action {
             MenuBarAction::Show => {}
             MenuBarAction::NewLocal => self.open_local(),
+            MenuBarAction::CheckForUpdates => self.updater.check(true),
             MenuBarAction::Quit => {
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -1449,6 +1474,16 @@ impl ShellHopperApp {
 
     fn tab_bar(&mut self, root: &mut egui::Ui) {
         let tab_ids = self.tab_ids();
+        let update_version = {
+            #[cfg(target_os = "macos")]
+            {
+                self.updater.ready_version().map(str::to_owned)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None::<String>
+            }
+        };
         egui::Panel::top("tabs")
             .exact_size(TITLEBAR_HEIGHT)
             .frame(
@@ -1466,11 +1501,13 @@ impl ShellHopperApp {
                 let mut rename = None;
                 let mut reorder = None;
                 let mut new_tab = false;
+                let mut update = false;
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
+                    let update_width = if update_version.is_some() { 132.0 } else { 0.0 };
                     egui::ScrollArea::horizontal()
                         .id_salt("terminal_tabs")
-                        .max_width(ui.available_width() - 34.0)
+                        .max_width((ui.available_width() - 34.0 - update_width).max(40.0))
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.horizontal_centered(|ui| {
@@ -1618,7 +1655,19 @@ impl ShellHopperApp {
                     new_tab = theme::new_tab_button(ui)
                         .on_hover_text("New local terminal")
                         .clicked();
+                    if let Some(version) = &update_version {
+                        let label = format!("Update to v{version}");
+                        update = ui
+                            .add(theme::secondary_button(&label, 128.0))
+                            .on_hover_text("Restart ShellHopper and install the verified update")
+                            .clicked();
+                    }
                 });
+
+                #[cfg(target_os = "macos")]
+                if update {
+                    self.show_update_confirmation = true;
+                }
 
                 if let Some(id) = activate {
                     self.active_session = Some(id);
@@ -3207,6 +3256,60 @@ impl eframe::App for ShellHopperApp {
                 });
         }
 
+        #[cfg(target_os = "macos")]
+        if self.show_update_confirmation {
+            if let Some(version) = self.updater.ready_version().map(str::to_owned) {
+                let mut install = false;
+                let mut cancel = false;
+                egui::Window::new(format!("Update to ShellHopper v{version}?"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .fixed_size([390.0, 185.0])
+                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(root, |ui| {
+                        ui.set_min_width(350.0);
+                        ui.label("The update is downloaded, signed, and ready to install.");
+                        if !self.sessions.is_empty() {
+                            ui.label(
+                                "Updating will close open terminal processes. Your tab layout will return after relaunch.",
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(theme::primary_button("Update and Restart", 132.0))
+                                    .clicked()
+                                {
+                                    install = true;
+                                }
+                                if ui.add(theme::secondary_button("Later", 72.0)).clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        });
+                    });
+                if cancel {
+                    self.show_update_confirmation = false;
+                } else if install {
+                    self.persist_tab_layout();
+                    match self.updater.install_and_relaunch() {
+                        Ok(()) => {
+                            self.quit_confirmed = true;
+                            self.show_update_confirmation = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => {
+                            self.show_update_confirmation = false;
+                            self.message = Some(error);
+                        }
+                    }
+                }
+            } else {
+                self.show_update_confirmation = false;
+            }
+        }
+
         if let Some(message) = self.message.clone() {
             egui::Window::new("ShellHopper")
                 .collapsible(false)
@@ -3225,7 +3328,8 @@ impl eframe::App for ShellHopperApp {
                 });
         }
         self.persist_tab_layout();
-        // No timer: the reader threads request a repaint whenever output arrives.
+        #[cfg(target_os = "macos")]
+        ctx.request_repaint_after(std::time::Duration::from_secs(10 * 60));
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
