@@ -38,6 +38,7 @@ pub struct ShellHopperApp {
     splits: BTreeMap<u64, PaneLayout>,
     active_session: Option<u64>,
     terminal_focus: Option<u64>,
+    terminal_selection: Option<(u64, LayoutJob)>,
     next_session_id: u64,
     next_split_id: u64,
     /// Which session gets first call on the next frame's output budget.
@@ -353,6 +354,7 @@ impl ShellHopperApp {
             splits: BTreeMap::new(),
             active_session: None,
             terminal_focus: None,
+            terminal_selection: None,
             next_session_id: 1,
             next_split_id: 1,
             poll_start: 0,
@@ -1979,7 +1981,23 @@ impl ShellHopperApp {
             .clamp(2.0, u16::MAX as f32) as u16;
         session.resize(rows, cols);
 
-        let terminal = terminal_layout(session.screen(), search.as_deref());
+        let has_selection = ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection();
+        if !has_selection {
+            self.terminal_selection = None;
+        }
+        // Keep scrolling output from replacing the text under an active selection.
+        let terminal = self
+            .terminal_selection
+            .as_ref()
+            .filter(|(selected_id, _)| has_selection && *selected_id == id)
+            .map(|(_, terminal)| terminal.clone())
+            .unwrap_or_else(|| terminal_layout(session.screen(), search.as_deref()));
+        let terminal_snapshot = ctx
+            .input(|input| input.pointer.primary_down())
+            .then(|| terminal.clone());
         let screen = session.screen();
         let application_cursor = screen.application_cursor();
         let bracketed_paste = screen.bracketed_paste();
@@ -1988,6 +2006,7 @@ impl ShellHopperApp {
         let sgr_mouse = mouse_mode != vt100::MouseProtocolMode::None
             && screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
         let shift_held = ctx.input(|input| input.modifiers.shift);
+        let terminal_selectable = !sgr_mouse || shift_held;
         let scroll_source = if alternate_screen || sgr_mouse {
             egui::scroll_area::ScrollSource::NONE
         } else {
@@ -1998,10 +2017,12 @@ impl ShellHopperApp {
         let mut reconnect = false;
         let mut split = None;
         let mut close = false;
+        let mut paste_from_clipboard = false;
         let mut paste_saved_command = None;
         let mut manage_saved_commands = false;
         let mut open_error = None;
         let mut dropped_paths = Vec::new();
+        let mut selecting_terminal = false;
         let reconnectable =
             session.host_name().is_some() && session.state() == SessionState::Disconnected;
         egui::ScrollArea::vertical()
@@ -2012,12 +2033,15 @@ impl ShellHopperApp {
                     .push_id(("terminal", id), |ui| {
                         ui.add(
                             egui::Label::new(terminal)
-                                .selectable(!sgr_mouse || shift_held)
+                                .selectable(terminal_selectable)
                                 .sense(Sense::click_and_drag())
                                 .wrap_mode(egui::TextWrapMode::Extend),
                         )
                     })
                     .inner;
+                selecting_terminal = terminal_selectable
+                    && response.is_pointer_button_down_on()
+                    && ctx.input(|input| input.pointer.primary_down());
                 let input_state = TerminalInputState {
                     rect: response.rect,
                     cell_width,
@@ -2102,6 +2126,11 @@ impl ShellHopperApp {
                     }
                 }
                 response.context_menu(|ui| {
+                    if ui.button("Paste    ⌘V").clicked() {
+                        paste_from_clipboard = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.menu_button("Connect to host", |ui| {
                         for group in groups {
                             ui.menu_button(group, |ui| {
@@ -2204,6 +2233,14 @@ impl ShellHopperApp {
                     handle_terminal_input(ctx, session, input_state);
                 }
             });
+        if selecting_terminal {
+            self.terminal_selection = terminal_snapshot.map(|terminal| (id, terminal));
+        }
+        if paste_from_clipboard {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            self.active_session = Some(id);
+            self.terminal_focus = Some(id);
+        }
         if let Some(command) = paste_saved_command {
             session.scroll_to_live();
             session.send(&paste_sequence(&command, bracketed_paste));
