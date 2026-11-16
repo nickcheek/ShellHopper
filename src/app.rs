@@ -1492,9 +1492,6 @@ impl ShellHopperApp {
                     .inner_margin(Margin::symmetric(8, 0)),
             )
             .show(root, |ui| {
-                // Registered first so the tabs on top of it stay clickable.
-                theme::window_drag_area(ui, ui.max_rect(), "titlebar");
-
                 let mut activate = None;
                 let mut close = None;
                 let mut context_action = None;
@@ -1502,6 +1499,8 @@ impl ShellHopperApp {
                 let mut reorder = None;
                 let mut new_tab = false;
                 let mut update = false;
+                let mut controls_right = ui.max_rect().left();
+                let mut update_left = None;
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let update_width = if update_version.is_some() { 132.0 } else { 0.0 };
@@ -1656,21 +1655,36 @@ impl ShellHopperApp {
                                 }
                             });
                         });
-                    new_tab = theme::new_tab_button(ui)
-                        .on_hover_text("New local terminal")
-                        .clicked();
+                    let new_tab_response =
+                        theme::new_tab_button(ui).on_hover_text("New local terminal");
+                    controls_right = new_tab_response.rect.right();
+                    new_tab = new_tab_response.clicked();
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(version) = &update_version {
                             let label = format!("Update to v{version}");
-                            update = ui
+                            let response = ui
                                 .add(theme::secondary_button(&label, 128.0))
                                 .on_hover_text(
                                     "Restart ShellHopper and install the verified update",
-                                )
-                                .clicked();
+                                );
+                            update_left = Some(response.rect.left());
+                            update = response.clicked();
                         }
                     });
                 });
+
+                let drag_left = controls_right + 4.0;
+                let drag_right = update_left.unwrap_or(ui.max_rect().right()) - 4.0;
+                if drag_left < drag_right {
+                    theme::window_drag_area(
+                        ui,
+                        egui::Rect::from_min_max(
+                            egui::pos2(drag_left, ui.max_rect().top()),
+                            egui::pos2(drag_right, ui.max_rect().bottom()),
+                        ),
+                        "titlebar",
+                    );
+                }
 
                 #[cfg(target_os = "macos")]
                 if update {
