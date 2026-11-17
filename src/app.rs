@@ -2433,13 +2433,8 @@ impl ShellHopperApp {
                         ui.close();
                     }
                 });
-                let focus = ui.interact(
-                    response.rect,
-                    egui::Id::new(("terminal-focus", id)),
-                    Sense::focusable_noninteractive(),
-                );
                 if request_focus {
-                    focus.request_focus();
+                    response.request_focus();
                 }
                 let pointer_pressed =
                     response.hovered() && ctx.input(|input| input.pointer.any_pressed());
@@ -2447,7 +2442,7 @@ impl ShellHopperApp {
                     || response.clicked()
                     || response.drag_started_by(egui::PointerButton::Primary)
                 {
-                    focus.request_focus();
+                    response.request_focus();
                     activated = true;
                 }
                 if response.hovered() && !alternate_screen && (!sgr_mouse || shift_held) {
@@ -2457,10 +2452,10 @@ impl ShellHopperApp {
                         ctx.request_repaint();
                     }
                 }
-                if focus.has_focus() {
+                if response.has_focus() {
                     ui.memory_mut(|memory| {
                         memory.set_focus_lock_filter(
-                            focus.id,
+                            response.id,
                             egui::EventFilter {
                                 tab: true,
                                 horizontal_arrows: true,
