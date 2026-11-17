@@ -14,7 +14,7 @@ use std::{
 const RELEASE_API: &str = "https://api.github.com/repos/nickcheek/ShellHopper/releases/latest";
 const RELEASES_URL: &str = "https://github.com/nickcheek/ShellHopper/releases/download";
 const APPLE_TEAM_ID: &str = "MP2BU74JC2";
-const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const OLD_BUNDLE_PREFIX: &str = ".ShellHopper-update-";
 
 pub struct Updater {
@@ -28,12 +28,12 @@ pub struct Updater {
 enum UpdateState {
     Idle,
     Checking,
-    Downloading,
+    Downloading(String),
     Ready(PreparedUpdate),
 }
 
 enum UpdateEvent {
-    Downloading,
+    Downloading(String),
     Ready(PreparedUpdate),
     Current { manual: bool },
     Failed { error: String, manual: bool },
@@ -71,7 +71,7 @@ impl Updater {
         let sender = self.sender.clone();
         let ctx = self.ctx.clone();
         thread::spawn(move || {
-            let event = match prepare_update(&sender) {
+            let event = match prepare_update(&sender, &ctx) {
                 Ok(Some(update)) => UpdateEvent::Ready(update),
                 Ok(None) => UpdateEvent::Current { manual },
                 Err(error) => UpdateEvent::Failed { error, manual },
@@ -95,7 +95,7 @@ impl Updater {
         let mut notice = None;
         while let Ok(event) = self.receiver.try_recv() {
             match event {
-                UpdateEvent::Downloading => self.state = UpdateState::Downloading,
+                UpdateEvent::Downloading(version) => self.state = UpdateState::Downloading(version),
                 UpdateEvent::Ready(update) => {
                     self.last_check = Some(Instant::now());
                     self.state = UpdateState::Ready(update);
@@ -126,6 +126,14 @@ impl Updater {
         }
     }
 
+    pub fn activity_label(&self) -> Option<String> {
+        match &self.state {
+            UpdateState::Checking => Some("Checking for updates…".into()),
+            UpdateState::Downloading(version) => Some(format!("Downloading v{version}…")),
+            UpdateState::Idle | UpdateState::Ready(_) => None,
+        }
+    }
+
     pub fn install_and_relaunch(&mut self) -> Result<(), String> {
         let UpdateState::Ready(update) = std::mem::replace(&mut self.state, UpdateState::Idle)
         else {
@@ -150,7 +158,10 @@ impl PreparedUpdate {
     }
 }
 
-fn prepare_update(sender: &Sender<UpdateEvent>) -> Result<Option<PreparedUpdate>, String> {
+fn prepare_update(
+    sender: &Sender<UpdateEvent>,
+    ctx: &Context,
+) -> Result<Option<PreparedUpdate>, String> {
     let installed_app = installed_bundle()?;
     let temp = TempDirectory::new()?;
     let release_json = temp.path.join("release.json");
@@ -164,7 +175,8 @@ fn prepare_update(sender: &Sender<UpdateEvent>) -> Result<Option<PreparedUpdate>
         return Ok(None);
     }
 
-    let _ = sender.send(UpdateEvent::Downloading);
+    let _ = sender.send(UpdateEvent::Downloading(version.to_owned()));
+    ctx.request_repaint();
     let asset_name = format!("ShellHopper-{version}.dmg");
     let asset_url = format!("{RELEASES_URL}/{tag}/{asset_name}");
     let dmg = temp.path.join(&asset_name);

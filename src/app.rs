@@ -1496,14 +1496,17 @@ impl ShellHopperApp {
 
     fn tab_bar(&mut self, root: &mut egui::Ui) {
         let tab_ids = self.tab_ids();
-        let update_version = {
+        let (update_version, update_activity) = {
             #[cfg(target_os = "macos")]
             {
-                self.updater.ready_version().map(str::to_owned)
+                (
+                    self.updater.ready_version().map(str::to_owned),
+                    self.updater.activity_label(),
+                )
             }
             #[cfg(not(target_os = "macos"))]
             {
-                None::<String>
+                (None::<String>, None::<String>)
             }
         };
         egui::Panel::top("tabs")
@@ -1525,7 +1528,13 @@ impl ShellHopperApp {
                 let mut update_left = None;
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    let update_width = if update_version.is_some() { 132.0 } else { 0.0 };
+                    let update_width = if update_version.is_some() {
+                        132.0
+                    } else if update_activity.is_some() {
+                        148.0
+                    } else {
+                        0.0
+                    };
                     egui::ScrollArea::horizontal()
                         .id_salt("terminal_tabs")
                         .max_width((ui.available_width() - 34.0 - update_width).max(40.0))
@@ -1697,6 +1706,9 @@ impl ShellHopperApp {
                                 );
                             update_left = Some(response.rect.left());
                             update = response.clicked();
+                        } else if let Some(label) = update_activity {
+                            let response = ui.label(RichText::new(label).size(11.5).color(MUTED));
+                            update_left = Some(response.rect.left());
                         }
                     });
                 });
