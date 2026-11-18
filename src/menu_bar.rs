@@ -1,7 +1,9 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
-use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability, rc::Retained, sel};
+use objc2::{
+    ClassType, DeclaredClass, declare_class, msg_send, msg_send_id, mutability, rc::Retained, sel,
+};
 use objc2_app_kit::{
     NSApplication, NSImage, NSMenu, NSMenuItem, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
 };
@@ -14,6 +16,7 @@ pub enum MenuBarAction {
     Show,
     NewLocal,
     CheckForUpdates,
+    ToggleWordWrap,
     OpenHost(String),
     Quit,
 }
@@ -107,6 +110,7 @@ impl MenuBar {
         self.add_action("New Local Terminal", MenuBarAction::NewLocal);
         self.add_action("Check for Updates…", MenuBarAction::CheckForUpdates);
         self.add_update_action_to_app_menu();
+        self.add_settings_to_app_menu(config);
         self.menu
             .addItem(&NSMenuItem::separatorItem(MainThreadMarker::new().unwrap()));
 
@@ -187,6 +191,38 @@ impl MenuBar {
         let item = Self::action_item(&self.target, self.actions.len(), "Check for Updates…");
         self.actions.push(MenuBarAction::CheckForUpdates);
         unsafe { menu.insertItem_atIndex(&item, 1.min(menu.numberOfItems())) };
+    }
+
+    fn add_settings_to_app_menu(&mut self, config: &AppConfig) {
+        let mtm = MainThreadMarker::new().unwrap();
+        let Some(menu) = (unsafe {
+            NSApplication::sharedApplication(mtm)
+                .mainMenu()
+                .and_then(|menu| menu.itemAtIndex(0))
+                .and_then(|item| item.submenu())
+        }) else {
+            return;
+        };
+        if let Some(item) = unsafe { menu.itemWithTitle(ns_string!("Settings")) } {
+            unsafe { menu.removeItem(&item) };
+        }
+        let settings_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                ns_string!("Settings"),
+                None,
+                ns_string!(""),
+            )
+        };
+        let submenu = unsafe { NSMenu::initWithTitle(mtm.alloc(), ns_string!("Settings")) };
+        let word_wrap = Self::action_item(&self.target, self.actions.len(), "Word Wrap");
+        self.actions.push(MenuBarAction::ToggleWordWrap);
+        // NSControlStateValueOn (1) draws the checkmark; Off (0) draws nothing.
+        let state: isize = if config.no_word_wrap { 0 } else { 1 };
+        let _: () = unsafe { msg_send![&*word_wrap, setState: state] };
+        submenu.addItem(&word_wrap);
+        settings_item.setSubmenu(Some(&submenu));
+        unsafe { menu.insertItem_atIndex(&settings_item, 2.min(menu.numberOfItems())) };
     }
 
     fn add_action_to(

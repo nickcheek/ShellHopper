@@ -32,6 +32,9 @@ pub struct AppConfig {
     pub collapsed_groups: BTreeSet<String>,
     #[serde(default)]
     pub host_separators: BTreeSet<String>,
+    /// Stored inverted so that word wrap stays on unless it was turned off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_word_wrap: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

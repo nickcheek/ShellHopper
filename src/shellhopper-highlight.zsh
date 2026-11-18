@@ -2,6 +2,11 @@
 
 autoload -Uz add-zle-hook-widget add-zsh-hook
 
+if [[ -n ${SHELLHOPPER_MARKER_TOKEN-} ]]; then
+  typeset -g _shellhopper_token=$SHELLHOPPER_MARKER_TOKEN
+  unset SHELLHOPPER_MARKER_TOKEN
+fi
+
 _shellhopper_record_command() {
   local command=$1
   command=${command//\\/\\\\}
@@ -9,7 +14,8 @@ _shellhopper_record_command() {
   command=${command//$'\a'/\\a}
   command=${command//$'\n'/\\n}
   command=${command//$'\r'/\\r}
-  printf '\e]1337;ShellHopperCommand=%s\a' "$command"
+  [[ -n $_shellhopper_token ]] || return
+  printf '\e]1337;ShellHopper%s;Command=%s\a' "$_shellhopper_token" "$command"
 }
 
 _shellhopper_syntax_highlight() {
@@ -46,3 +52,28 @@ _shellhopper_syntax_highlight() {
 add-zle-hook-widget line-init _shellhopper_syntax_highlight
 add-zle-hook-widget line-pre-redraw _shellhopper_syntax_highlight
 add-zsh-hook preexec _shellhopper_record_command
+
+_shellhopper_set_buffer() {
+  local text
+  zle .bracketed-paste text
+  BUFFER=$text
+  CURSOR=${#BUFFER}
+}
+
+_shellhopper_accept_line() {
+  zle .accept-line
+}
+
+zle -N _shellhopper_set_buffer
+zle -N _shellhopper_accept_line
+
+_shellhopper_prompt() {
+  [[ -n $_shellhopper_token ]] || return
+  local keymap
+  for keymap in emacs viins vicmd; do
+    bindkey -M $keymap '^[[5733~' _shellhopper_set_buffer
+    bindkey -M $keymap '^[[5734~' _shellhopper_accept_line
+  done
+  printf '\e]1337;ShellHopper%s;Prompt\a' "$_shellhopper_token"
+}
+add-zsh-hook precmd _shellhopper_prompt

@@ -594,6 +594,7 @@ impl ShellHopperApp {
             Ok(session) => {
                 self.sessions.push(session);
                 self.active_session = Some(id);
+                self.terminal_focus = Some(id);
             }
             Err(error) => self.message = Some(error),
         }
@@ -1054,6 +1055,10 @@ impl ShellHopperApp {
             MenuBarAction::Show => {}
             MenuBarAction::NewLocal => self.open_local(),
             MenuBarAction::CheckForUpdates => self.updater.check(true),
+            MenuBarAction::ToggleWordWrap => {
+                self.config.no_word_wrap = !self.config.no_word_wrap;
+                self.save_config();
+            }
             MenuBarAction::Quit => {
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -1739,6 +1744,7 @@ impl ShellHopperApp {
 
                 if let Some(id) = activate {
                     self.active_session = Some(id);
+                    self.terminal_focus = Some(id);
                 }
                 if let Some(id) = close {
                     self.close_session(id);
@@ -2113,6 +2119,7 @@ impl ShellHopperApp {
         let groups = &self.config.groups;
         let hosts = &self.config.hosts;
         let saved_commands = self.config.saved_commands.clone();
+        let word_wrap = !self.config.no_word_wrap;
         let mut file_drop_target = self.file_drop_target;
         let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) else {
             return;
@@ -2140,10 +2147,45 @@ impl ShellHopperApp {
         let cols = (ui.available_width() / cell_width)
             .floor()
             .clamp(20.0, u16::MAX as f32) as u16;
-        let rows = (ui.available_height() / row_height)
+        let show_command_editor = session.editor_active();
+        let pane_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(row_height * 2.0);
+        let terminal_height = pane_height;
+        let rows = (terminal_height / row_height)
             .floor()
             .clamp(2.0, u16::MAX as f32) as u16;
         session.resize(rows, cols);
+        // A multi-line command needs blank rows under the prompt, so scroll the
+        // screen up first, the way the shell would if it were drawing the text.
+        // With word wrap on, the editor spans the pane like the shell's own echo
+        // of the command: the first row starts after the prompt, later rows at
+        // the left edge. With it off, or while empty (an empty layout puts its
+        // cursor at the left edge), the whole editor starts after the prompt.
+        let pane_width = f32::from(cols) * cell_width;
+        let editor_wrap_width = if word_wrap {
+            pane_width + 0.5
+        } else {
+            f32::INFINITY
+        };
+        let mut editor_offset = 0.0;
+        let mut editor_indent = 0.0;
+        let mut editor_rows = 1;
+        if show_command_editor {
+            let prompt_width =
+                f32::from(command_editor_column(session.screen(), cols)) * cell_width;
+            if word_wrap && !session.command_input_mut().is_empty() {
+                editor_indent = prompt_width;
+            } else {
+                editor_offset = prompt_width;
+            }
+            let job = command_editor_job(
+                session.command_input_mut(),
+                editor_indent,
+                editor_wrap_width,
+            );
+            let height = ctx.fonts_mut(|fonts| fonts.layout_job(job)).size().y;
+            editor_rows = (height / row_height).ceil().clamp(1.0, f32::from(rows)) as u16;
+            session.reserve_rows_below_cursor(editor_rows - 1);
+        }
 
         if self
             .terminal_selection
@@ -2160,6 +2202,7 @@ impl ShellHopperApp {
             search.as_deref(),
             history_rows,
             selection.as_ref(),
+            !show_command_editor,
         );
         let screen = session.screen();
         let application_cursor = screen.application_cursor();
@@ -2182,10 +2225,27 @@ impl ShellHopperApp {
         let mut manage_saved_commands = false;
         let mut open_error = None;
         let mut dropped_paths = Vec::new();
+        let mut terminal_response_id = None;
+        let mut terminal_response_rect = None;
+        let mut focus_editor = false;
+        let mut copy_editor = false;
+        let mut cut_editor = false;
+        let editor_id = egui::Id::new(("command-editor", id));
+        let editor_selection = show_command_editor
+            .then(|| command_editor_selection(ctx, editor_id))
+            .flatten();
+        // The screen rows the command editor covers. Clicks there are the
+        // editor's, never the start of an output selection.
+        let editor_band = show_command_editor.then(|| {
+            let row = session.screen().cursor_position().0;
+            (row, editor_rows.min(rows.saturating_sub(row)).max(1))
+        });
+        let mut collapse_editor_selection = false;
         let reconnectable =
             session.host_name().is_some() && session.state() == SessionState::Disconnected;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .max_height(terminal_height)
             .scroll_source(egui::scroll_area::ScrollSource::NONE)
             .show(ui, |ui| {
                 let response = ui
@@ -2198,6 +2258,8 @@ impl ShellHopperApp {
                         )
                     })
                     .inner;
+                terminal_response_id = Some(response.id);
+                terminal_response_rect = Some(response.rect);
                 let input_state = TerminalInputState {
                     rect: response.rect,
                     cell_width,
@@ -2210,6 +2272,15 @@ impl ShellHopperApp {
                     mouse_mode,
                     sgr_mouse,
                 };
+                let editor_band_rect = editor_band.map(|(row, count)| {
+                    egui::Rect::from_min_size(
+                        egui::pos2(
+                            response.rect.left(),
+                            response.rect.top() + f32::from(row) * row_height,
+                        ),
+                        egui::vec2(response.rect.width(), f32::from(count) * row_height),
+                    )
+                });
                 let selection_start = ctx.input(|input| {
                     input.events.iter().find_map(|event| match event {
                         egui::Event::PointerButton {
@@ -2219,27 +2290,46 @@ impl ShellHopperApp {
                             modifiers,
                         } if terminal_selectable
                             && !modifiers.command
-                            && response.rect.contains(*pos) =>
+                            && response.rect.contains(*pos)
+                            && !editor_band_rect.is_some_and(|rect| rect.contains(*pos)) =>
                         {
-                            Some(*pos)
+                            Some((*pos, modifiers.shift))
                         }
                         _ => None,
                     })
                 });
-                if let Some(position) = selection_start {
+                // A press on a menu or window that floats over the terminal is
+                // not a press on the terminal, and must not restart the
+                // selection the menu is about to copy.
+                let selection_start = selection_start.filter(|(position, _)| {
+                    ctx.layer_id_at(*position)
+                        .is_none_or(|layer| layer == response.layer_id)
+                });
+                if let Some((position, extend)) = selection_start {
+                    collapse_editor_selection = true;
                     let point = terminal_selection_point(
                         position,
                         input_state,
                         history_rows,
                         session.scrollback(),
                     );
-                    self.terminal_selection = Some(TerminalSelection {
-                        session_id: id,
-                        anchor: point,
-                        head: point,
-                        cols,
-                        dragging: true,
-                    });
+                    if extend
+                        && let Some(selection) = self
+                            .terminal_selection
+                            .as_mut()
+                            .filter(|selection| selection.session_id == id)
+                    {
+                        selection.head = point;
+                        selection.dragging = true;
+                    } else {
+                        self.terminal_selection = Some(TerminalSelection {
+                            session_id: id,
+                            anchor: point,
+                            head: point,
+                            cols,
+                            dragging: true,
+                        });
+                    }
                     ctx.request_repaint();
                 }
                 if self
@@ -2288,6 +2378,30 @@ impl ShellHopperApp {
                         if !selection.has_text() {
                             self.terminal_selection = None;
                         }
+                    }
+                }
+                if terminal_selectable
+                    && (response.double_clicked() || response.triple_clicked())
+                    && let Some((col, row)) = response
+                        .interact_pointer_pos()
+                        .and_then(|position| terminal_cell(position, input_state))
+                {
+                    let range = if response.triple_clicked() {
+                        Some((0, cols))
+                    } else {
+                        terminal_word_range(session.screen(), row - 1, col - 1)
+                    };
+                    if let Some((start, end)) = range {
+                        let row = history_rows.saturating_sub(session.scrollback())
+                            + usize::from(row - 1);
+                        self.terminal_selection = Some(TerminalSelection {
+                            session_id: id,
+                            anchor: TerminalPoint { row, col: start },
+                            head: TerminalPoint { row, col: end },
+                            cols,
+                            dragging: false,
+                        });
+                        collapse_editor_selection = true;
                     }
                 }
                 let command_held = ctx.input(|input| input.modifiers.command);
@@ -2361,86 +2475,137 @@ impl ShellHopperApp {
                         file_drop_target = None;
                     }
                 }
-                response.context_menu(|ui| {
-                    let can_copy = self.terminal_selection.is_some_and(|selection| {
-                        selection.session_id == id && selection.has_text()
-                    });
-                    if ui
-                        .add_enabled(can_copy, egui::Button::new("Copy     ⌘C"))
-                        .clicked()
-                    {
-                        copy_selection = true;
-                        ui.close();
-                    }
-                    if ui.button("Paste    ⌘V").clicked() {
-                        paste_from_clipboard = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    ui.menu_button("Connect to host", |ui| {
-                        for group in groups {
-                            ui.menu_button(group, |ui| {
-                                for host in hosts.iter().filter(|host| host.group == *group) {
-                                    if ui.button(&host.name).clicked() {
-                                        connect_host = Some(host.name.clone());
+                // The editor sits on top of the terminal, so a right-click on
+                // it opens the same menu.
+                let editor_secondary_click = editor_band_rect.is_some_and(|rect| {
+                    ctx.input(|input| {
+                        input.pointer.secondary_clicked()
+                            && input
+                                .pointer
+                                .interact_pos()
+                                .is_some_and(|position| rect.contains(position))
+                    })
+                });
+                let menu_state = if response.secondary_clicked() || editor_secondary_click {
+                    Some(egui::SetOpenCommand::Bool(true))
+                } else if response.clicked() {
+                    Some(egui::SetOpenCommand::Bool(false))
+                } else {
+                    None
+                };
+                egui::Popup::menu(&response)
+                    .open_memory(menu_state)
+                    .at_pointer_fixed()
+                    .show(|ui| {
+                        let can_copy = editor_selection.is_some()
+                            || self.terminal_selection.is_some_and(|selection| {
+                                selection.session_id == id && selection.has_text()
+                            });
+                        if ui.button("Select All Output     ⌘A").clicked() {
+                            let (cursor_row, cursor_col) = session.screen().cursor_position();
+                            self.terminal_selection = Some(TerminalSelection {
+                                session_id: id,
+                                anchor: TerminalPoint { row: 0, col: 0 },
+                                head: TerminalPoint {
+                                    row: history_rows + usize::from(cursor_row),
+                                    col: cursor_col,
+                                },
+                                cols,
+                                dragging: false,
+                            });
+                            ui.close();
+                        }
+                        if show_command_editor
+                            && ui
+                                .add_enabled(
+                                    editor_selection.is_some(),
+                                    egui::Button::new("Cut      ⌘X"),
+                                )
+                                .clicked()
+                        {
+                            cut_editor = true;
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_copy, egui::Button::new("Copy     ⌘C"))
+                            .clicked()
+                        {
+                            if editor_selection.is_some() {
+                                copy_editor = true;
+                            } else {
+                                copy_selection = true;
+                            }
+                            ui.close();
+                        }
+                        if ui.button("Paste    ⌘V").clicked() {
+                            paste_from_clipboard = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        ui.menu_button("Connect to host", |ui| {
+                            for group in groups {
+                                ui.menu_button(group, |ui| {
+                                    for host in hosts.iter().filter(|host| host.group == *group) {
+                                        if ui.button(&host.name).clicked() {
+                                            connect_host = Some(host.name.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                        ui.menu_button("Saved commands", |ui| {
+                            if saved_commands.is_empty() {
+                                ui.add_enabled(false, egui::Button::new("No saved commands"));
+                            } else {
+                                for saved in &saved_commands {
+                                    let safe = !saved.command.contains(['\r', '\n']);
+                                    let connected = session.state() == SessionState::Connected;
+                                    if ui
+                                        .add_enabled(
+                                            safe && connected && !alternate_screen,
+                                            egui::Button::new(&saved.name),
+                                        )
+                                        .on_disabled_hover_text(if !safe {
+                                            "Saved commands must be one line"
+                                        } else if !connected {
+                                            "Connect this terminal before pasting a command"
+                                        } else {
+                                            "Leave the full-screen program before pasting a command"
+                                        })
+                                        .clicked()
+                                    {
+                                        paste_saved_command = Some(saved.command.clone());
                                         ui.close();
                                     }
                                 }
-                            });
-                        }
-                    });
-                    ui.menu_button("Saved commands", |ui| {
-                        if saved_commands.is_empty() {
-                            ui.add_enabled(false, egui::Button::new("No saved commands"));
-                        } else {
-                            for saved in &saved_commands {
-                                let safe = !saved.command.contains(['\r', '\n']);
-                                let connected = session.state() == SessionState::Connected;
-                                if ui
-                                    .add_enabled(
-                                        safe && connected && !alternate_screen,
-                                        egui::Button::new(&saved.name),
-                                    )
-                                    .on_disabled_hover_text(if !safe {
-                                        "Saved commands must be one line"
-                                    } else if !connected {
-                                        "Connect this terminal before pasting a command"
-                                    } else {
-                                        "Leave the full-screen program before pasting a command"
-                                    })
-                                    .clicked()
-                                {
-                                    paste_saved_command = Some(saved.command.clone());
-                                    ui.close();
-                                }
                             }
+                            ui.separator();
+                            if ui.button("Manage saved commands…").clicked() {
+                                manage_saved_commands = true;
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        if reconnectable && ui.button("Reconnect SSH").clicked() {
+                            reconnect = true;
+                            ui.close();
+                        }
+                        if ui.button("Split right    ⌘D").clicked() {
+                            split = Some(SavedSplitDirection::Right);
+                            ui.close();
+                        }
+                        if ui.button("Split down    ⇧⌘D").clicked() {
+                            split = Some(SavedSplitDirection::Down);
+                            ui.close();
                         }
                         ui.separator();
-                        if ui.button("Manage saved commands…").clicked() {
-                            manage_saved_commands = true;
+                        if ui.button(close_label).clicked() {
+                            close = true;
                             ui.close();
                         }
                     });
-                    ui.separator();
-                    if reconnectable && ui.button("Reconnect SSH").clicked() {
-                        reconnect = true;
-                        ui.close();
-                    }
-                    if ui.button("Split right    ⌘D").clicked() {
-                        split = Some(SavedSplitDirection::Right);
-                        ui.close();
-                    }
-                    if ui.button("Split down    ⇧⌘D").clicked() {
-                        split = Some(SavedSplitDirection::Down);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(close_label).clicked() {
-                        close = true;
-                        ui.close();
-                    }
-                });
-                if request_focus {
+                if request_focus && !show_command_editor {
                     response.request_focus();
                 }
                 let pointer_pressed =
@@ -2449,8 +2614,15 @@ impl ShellHopperApp {
                     || response.clicked()
                     || response.drag_started_by(egui::PointerButton::Primary)
                 {
-                    response.request_focus();
+                    if show_command_editor {
+                        focus_editor = true;
+                    } else {
+                        response.request_focus();
+                    }
                     activated = true;
+                }
+                if show_command_editor && response.has_focus() {
+                    focus_editor = true;
                 }
                 if response.hovered() && !alternate_screen && (!sgr_mouse || shift_held) {
                     let scroll = ctx.input(|input| input.smooth_scroll_delta.y);
@@ -2459,7 +2631,20 @@ impl ShellHopperApp {
                         ctx.request_repaint();
                     }
                 }
-                if response.has_focus() {
+                if response.has_focus() && !show_command_editor {
+                    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, Key::A)) {
+                        let (cursor_row, cursor_col) = session.screen().cursor_position();
+                        self.terminal_selection = Some(TerminalSelection {
+                            session_id: id,
+                            anchor: TerminalPoint { row: 0, col: 0 },
+                            head: TerminalPoint {
+                                row: history_rows + usize::from(cursor_row),
+                                col: cursor_col,
+                            },
+                            cols,
+                            dragging: false,
+                        });
+                    }
                     ui.memory_mut(|memory| {
                         memory.set_focus_lock_filter(
                             response.id,
@@ -2483,6 +2668,203 @@ impl ShellHopperApp {
                         handle_terminal_input(ctx, session, input_state, selection, history_rows);
                 }
             });
+        if (copy_editor || cut_editor)
+            && let Some(range) = &editor_selection
+        {
+            let input = session.command_input_mut();
+            let byte = |index: usize| {
+                input
+                    .char_indices()
+                    .nth(index)
+                    .map_or(input.len(), |(byte, _)| byte)
+            };
+            let bytes = byte(range.start)..byte(range.end);
+            ctx.copy_text(input[bytes.clone()].to_owned());
+            if cut_editor {
+                input.replace_range(bytes, "");
+                if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
+                    let start = egui::text::CCursor::new(range.start);
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(start)));
+                    state.store(ctx, editor_id);
+                }
+            }
+            focus_editor = true;
+        }
+        let mut submit_command = false;
+        let mut complete_command = false;
+        let mut editor_touched = false;
+        if show_command_editor {
+            // Focus first, so a paste or key that arrives this frame lands here.
+            if request_focus || focus_editor {
+                ctx.memory_mut(|memory| memory.request_focus(editor_id));
+            }
+            // A right-click would otherwise move the editor's cursor and drop
+            // the highlight the menu is meant to act on.
+            let keep_editor_selection = editor_selection.clone().filter(|_| {
+                !cut_editor
+                    && ctx.input(|input| {
+                        let button = egui::PointerButton::Secondary;
+                        input.pointer.button_pressed(button)
+                            || input.pointer.button_down(button)
+                            || input.pointer.button_released(button)
+                    })
+            });
+            if ctx.memory(|memory| memory.has_focus(editor_id)) {
+                // In a multi-line command the arrows move between its lines.
+                let single_line = !session.command_input_mut().contains('\n');
+                let (submit, older, newer, tab, interrupt, end_of_input, clear) =
+                    ctx.input_mut(|input| {
+                        (
+                            !input.modifiers.shift
+                                && input.consume_key(egui::Modifiers::NONE, Key::Enter),
+                            single_line && input.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                            single_line && input.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                            input.consume_key(egui::Modifiers::NONE, Key::Tab),
+                            input.consume_key(egui::Modifiers::CTRL, Key::C),
+                            input.consume_key(egui::Modifiers::CTRL, Key::D),
+                            input.consume_key(egui::Modifiers::CTRL, Key::L),
+                        )
+                    });
+                let empty = session.command_input_mut().is_empty();
+                if older {
+                    session.recall_command(true);
+                }
+                if newer {
+                    session.recall_command(false);
+                }
+                if interrupt {
+                    if empty {
+                        session.send(b"\x03");
+                    } else {
+                        session.take_command_input();
+                    }
+                }
+                if end_of_input && empty {
+                    session.send(b"\x04");
+                }
+                if clear {
+                    session.send(b"\x0c");
+                }
+                complete_command = tab && !empty;
+                submit_command = submit;
+            }
+            // The output selection and the editor selection never coexist, so
+            // Copy always has exactly one thing it can mean.
+            if collapse_editor_selection
+                && let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id)
+                && let Some(range) = state.cursor.char_range()
+            {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(range.primary)));
+                state.store(ctx, editor_id);
+            }
+            if session.take_input_cursor_to_end()
+                && let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id)
+            {
+                let end = egui::text::CCursor::new(session.command_input_mut().chars().count());
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                state.store(ctx, editor_id);
+            }
+            if let Some(terminal_rect) = terminal_response_rect {
+                let (cursor_row, _) = session.screen().cursor_position();
+                let left = terminal_rect.left() + editor_offset;
+                let top = terminal_rect.top() + f32::from(cursor_row) * row_height;
+                let visible_rows = editor_rows.min(rows.saturating_sub(cursor_row)).max(1);
+                let editor_rect = egui::Rect::from_min_size(
+                    egui::pos2(left, top),
+                    egui::vec2(
+                        (pane_width - editor_offset).max(cell_width),
+                        f32::from(visible_rows) * row_height,
+                    ),
+                );
+                let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _: f32| {
+                    let job = command_editor_job(text.as_str(), editor_indent, editor_wrap_width);
+                    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+                };
+                let text_edit = egui::TextEdit::multiline(session.command_input_mut())
+                    .id(editor_id)
+                    .font(FontId::monospace(TERM_FONT_SIZE))
+                    .layouter(&mut layouter)
+                    .desired_width(editor_rect.width())
+                    .desired_rows(1)
+                    .margin(Margin::ZERO)
+                    .frame(egui::Frame::NONE)
+                    .return_key(egui::KeyboardShortcut::new(
+                        egui::Modifiers::SHIFT,
+                        Key::Enter,
+                    ))
+                    .lock_focus(true);
+                let editor = if word_wrap {
+                    ui.place(editor_rect, text_edit)
+                } else {
+                    // Unwrapped lines can run past the pane, so they scroll
+                    // sideways to follow the cursor.
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
+                    egui::ScrollArea::horizontal()
+                        .id_salt(("command-editor-scroll", id))
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(&mut child, |ui| ui.add(text_edit))
+                        .inner
+                };
+                if (request_focus || focus_editor) && !submit_command {
+                    editor.request_focus();
+                }
+                if let Some(range) = keep_editor_selection
+                    && let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id)
+                {
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(range.start),
+                            egui::text::CCursor::new(range.end),
+                        )));
+                    state.store(ctx, editor_id);
+                }
+                let editor_selected = egui::TextEdit::load_state(ctx, editor_id)
+                    .and_then(|state| state.cursor.char_range())
+                    .is_some_and(|range| !range.is_empty());
+                if editor.has_focus() {
+                    ui.memory_mut(|memory| {
+                        memory.set_focus_lock_filter(
+                            editor_id,
+                            egui::EventFilter {
+                                tab: true,
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                escape: true,
+                            },
+                        );
+                    });
+                    if !editor_selected
+                        && ctx.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .any(|event| matches!(event, egui::Event::Copy))
+                        })
+                    {
+                        copy_selection = true;
+                    }
+                }
+                editor_touched = editor_selected
+                    || editor.changed()
+                    || editor.clicked()
+                    || editor.drag_started();
+            }
+        }
+        if editor_touched
+            && self
+                .terminal_selection
+                .is_some_and(|selection| selection.session_id == id)
+        {
+            self.terminal_selection = None;
+        }
         if delete_selection {
             self.terminal_selection = None;
         }
@@ -2500,10 +2882,27 @@ impl ShellHopperApp {
             self.terminal_focus = Some(id);
         }
         if let Some(command) = paste_saved_command {
-            session.scroll_to_live();
-            session.send(&paste_sequence(&command, bracketed_paste));
+            paste_command(session, &command, bracketed_paste);
             self.active_session = Some(id);
             self.terminal_focus = Some(id);
+        }
+        if submit_command || complete_command {
+            let command = session.take_command_input();
+            let command = if command.trim().is_empty() {
+                ""
+            } else {
+                command.as_str()
+            };
+            let mut bytes = shell_buffer_sequence(command);
+            if submit_command {
+                bytes.extend_from_slice(SHELL_ACCEPT_LINE);
+            } else {
+                bytes.push(b'\t');
+            }
+            session.hand_off(&bytes);
+            if let Some(response_id) = terminal_response_id {
+                ctx.memory_mut(|memory| memory.request_focus(response_id));
+            }
         }
         self.file_drop_target = file_drop_target;
         if !dropped_paths.is_empty() {
@@ -3052,8 +3451,7 @@ impl ShellHopperApp {
         if let Some(command) = paste
             && let Some(session) = self.sessions.iter_mut().find(|session| session.id == id)
         {
-            session.scroll_to_live();
-            session.send(&paste_sequence(&command, bracketed_paste));
+            paste_command(session, &command, bracketed_paste);
             self.command_history_open = false;
             self.active_session = Some(id);
             self.terminal_focus = Some(id);
@@ -3664,6 +4062,100 @@ fn terminal_character_count(
         .sum()
 }
 
+/// Private key sequences bound by the zsh integration, so the editor never
+/// depends on the user's own key bindings or paste handling.
+const SHELL_SET_BUFFER: &[u8] = b"\x1b[5733~";
+const SHELL_ACCEPT_LINE: &[u8] = b"\x1b[5734~";
+
+/// Makes the shell's line buffer exactly `text`, replacing whatever it held.
+fn shell_buffer_sequence(text: &str) -> Vec<u8> {
+    // Drop escape characters so the text cannot end its own payload early.
+    let text = text.replace('\x1b', "");
+    let mut bytes = SHELL_SET_BUFFER.to_vec();
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+/// Puts a command where the user is typing: the command editor at a prompt,
+/// otherwise the running program.
+fn paste_command(session: &mut TerminalSession, command: &str, bracketed: bool) {
+    session.scroll_to_live();
+    if session.editor_active() {
+        session.insert_command_input(command);
+    } else {
+        session.send(&paste_sequence(command, bracketed));
+    }
+}
+
+/// The highlighted part of the command editor, as character offsets.
+fn command_editor_selection(ctx: &egui::Context, id: egui::Id) -> Option<std::ops::Range<usize>> {
+    let range = egui::TextEdit::load_state(ctx, id)?
+        .cursor
+        .char_range()?
+        .as_sorted_char_range();
+    (range.start != range.end).then_some(range.start.0..range.end.0)
+}
+
+/// The run of word characters around a cell, for double-click selection.
+fn terminal_word_range(screen: &vt100::Screen, row: u16, col: u16) -> Option<(u16, u16)> {
+    let is_word = |col: u16| {
+        screen.cell(row, col).is_some_and(|cell| {
+            cell.is_wide_continuation()
+                || cell.contents().chars().next().is_some_and(|character| {
+                    character.is_alphanumeric() || "_-./~+@:%#=?&".contains(character)
+                })
+        })
+    };
+    if !is_word(col) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && is_word(start - 1) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < screen.size().1 && is_word(end) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// The column where the shell's prompt ends and the command editor begins.
+fn command_editor_column(screen: &vt100::Screen, cols: u16) -> u16 {
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    if cursor_col == cols.saturating_sub(1) {
+        (0..cursor_col)
+            .rev()
+            .find(|&col| {
+                screen
+                    .cell(cursor_row, col)
+                    .is_some_and(|cell| !cell.contents().trim().is_empty())
+            })
+            .map_or(cursor_col, |col| col + 1)
+    } else {
+        cursor_col
+    }
+}
+
+/// Lays the command out on the terminal's own grid, wrapping at the pane edge.
+fn command_editor_job(text: &str, indent: f32, wrap_width: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.append(
+        text,
+        indent,
+        TextFormat {
+            font_id: FontId::monospace(TERM_FONT_SIZE),
+            color: Color32::from_rgb(225, 228, 238),
+            line_height: Some(TERM_LINE_HEIGHT),
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = wrap_width;
+    job.wrap.break_anywhere = true;
+    job
+}
+
 fn paste_sequence(text: &str, bracketed: bool) -> Vec<u8> {
     if !bracketed {
         return text.as_bytes().to_vec();
@@ -3990,6 +4482,7 @@ fn terminal_layout(
     search: Option<&str>,
     history_rows: usize,
     selection: Option<&TerminalSelection>,
+    show_cursor: bool,
 ) -> LayoutJob {
     let (rows, cols) = screen.size();
     let cursor = screen.cursor_position();
@@ -4012,8 +4505,10 @@ fn terminal_layout(
                 continue;
             }
 
-            let cursor_here =
-                screen.scrollback() == 0 && !screen.hide_cursor() && cursor == (row, col);
+            let cursor_here = show_cursor
+                && screen.scrollback() == 0
+                && !screen.hide_cursor()
+                && cursor == (row, col);
             let mut foreground = terminal_color(cell.fgcolor(), Color32::from_rgb(225, 228, 238));
             let mut background = terminal_color(cell.bgcolor(), TERMINAL);
             if cell.bold() {
@@ -4325,6 +4820,79 @@ mod terminal_color_tests {
             terminal_key_sequence(Key::F5, egui::Modifiers::ALT, false),
             Some(b"\x1b[15;3~".to_vec())
         );
+    }
+
+    #[test]
+    fn command_editor_keeps_pasted_line_breaks_on_the_terminal_grid() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("editor");
+        let mut text = String::new();
+        let pasted =
+            "aws elbv2 describe-load-balancers \\\n  --region ca-central-1 \\\n  --output table";
+        for events in [vec![], vec![egui::Event::Paste(pasted.into())], vec![]] {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _: f32| {
+                    let job = command_editor_job(text.as_str(), 40.0, 2000.0);
+                    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+                };
+                let editor = ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .id(id)
+                        .layouter(&mut layouter)
+                        .desired_rows(1),
+                );
+                editor.request_focus();
+            });
+            output.textures_delta.clear();
+        }
+
+        assert_eq!(text, pasted);
+        let layout = |text: &str, indent: f32, width: f32| {
+            let job = command_editor_job(text, indent, width);
+            ctx.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+        assert_eq!(layout(&text, 40.0, 2000.0).size().y, 3.0 * TERM_LINE_HEIGHT);
+        assert!(layout("", 40.0, 2000.0).size().y <= TERM_LINE_HEIGHT);
+
+        let cursor_x = |text: &str, index: usize| {
+            layout(text, 40.0, 2000.0)
+                .pos_from_cursor(egui::text::CCursor::new(index))
+                .left()
+        };
+        assert_eq!(cursor_x("ab", 0), 40.0);
+        assert_eq!(cursor_x("ab\ncd", 3), 0.0);
+
+        let font = FontId::monospace(TERM_FONT_SIZE);
+        let cell = ctx.fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
+        let full = "x".repeat(20);
+        assert_eq!(layout(&full, 5.0 * cell, 25.0 * cell + 0.5).rows.len(), 1);
+        assert_eq!(layout(&full, 5.0 * cell, 24.0 * cell + 0.5).rows.len(), 2);
+        assert_eq!(layout(&full, 0.0, f32::INFINITY).rows.len(), 1);
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(b"cat ~/notes/todo.txt | grep -i 'fix me'");
+        let screen = parser.screen();
+
+        assert_eq!(terminal_word_range(screen, 0, 1), Some((0, 3)));
+        assert_eq!(terminal_word_range(screen, 0, 9), Some((4, 20)));
+        assert_eq!(terminal_word_range(screen, 0, 3), None);
+        assert_eq!(terminal_word_range(screen, 0, 21), None);
+    }
+
+    #[test]
+    fn editor_text_replaces_the_shell_buffer_without_escapes() {
+        assert_eq!(
+            shell_buffer_sequence("echo \x1b[201~hi"),
+            b"\x1b[5733~echo [201~hi\x1b[201~"
+        );
+        assert_eq!(shell_buffer_sequence(""), b"\x1b[5733~\x1b[201~");
     }
 
     #[test]

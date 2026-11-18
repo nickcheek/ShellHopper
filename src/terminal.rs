@@ -20,7 +20,8 @@ use crate::config::SshHost;
 const CHUNKS_PER_POLL: usize = 128;
 /// Chunks buffered before the reader thread waits for the UI to catch up.
 const CHANNEL_CAPACITY: usize = 64;
-const COMMAND_MARKER: &[u8] = b"\x1b]1337;ShellHopperCommand=";
+const COMMAND_PAYLOAD: &[u8] = b"Command=";
+const PROMPT_PAYLOAD: &[u8] = b"Prompt";
 const COMMAND_MARKER_LIMIT: usize = 64 * 1024;
 const COMMAND_HISTORY_LIMIT: usize = 1_000;
 
@@ -40,6 +41,14 @@ pub struct TerminalSession {
     ready_socket: Option<PathBuf>,
     pending_commands: VecDeque<String>,
     commands: Vec<String>,
+    command_input: String,
+    input_cursor_to_end: bool,
+    at_prompt: bool,
+    history_index: Option<usize>,
+    history_draft: String,
+    /// Per-session escape prefix that only this session's own zsh integration
+    /// knows. Sessions without it (SSH, other shells) never show the editor.
+    shell_marker: Option<Vec<u8>>,
     command_marker: Vec<u8>,
     parser: vt100::Parser,
     receiver: Option<mpsc::Receiver<Vec<u8>>>,
@@ -59,12 +68,18 @@ impl TerminalSession {
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.arg("-i");
+        let mut shell_marker = None;
         if is_zsh && let Some(zdotdir) = prepare_zsh_environment() {
             // The generated startup files forward to the user's own directory.
             if let Some(user_zdotdir) = env::var_os("ZDOTDIR") {
                 command.env("SHELLHOPPER_USER_ZDOTDIR", user_zdotdir);
             }
             command.env("ZDOTDIR", zdotdir);
+            // The integration reads and unsets this, so programs the shell runs
+            // (and servers reached through them) cannot forge its markers.
+            let token = session_nonce();
+            command.env("SHELLHOPPER_MARKER_TOKEN", &token);
+            shell_marker = Some(shell_marker_prefix(&token));
         }
         Self::spawn(
             id,
@@ -75,6 +90,10 @@ impl TerminalSession {
             None,
             ctx,
         )
+        .map(|mut session| {
+            session.shell_marker = shell_marker;
+            session
+        })
     }
 
     pub fn ssh(id: u64, host: &SshHost, ctx: &Context) -> Result<Self, String> {
@@ -106,6 +125,12 @@ impl TerminalSession {
             ready_socket: None,
             pending_commands: VecDeque::new(),
             commands: Vec::new(),
+            command_input: String::new(),
+            input_cursor_to_end: false,
+            at_prompt: false,
+            history_index: None,
+            history_draft: String::new(),
+            shell_marker: None,
             command_marker: Vec::new(),
             parser: vt100::Parser::new(size.rows, size.cols, 10_000),
             receiver: None,
@@ -185,6 +210,12 @@ impl TerminalSession {
             ready_socket,
             pending_commands: VecDeque::new(),
             commands: Vec::new(),
+            command_input: String::new(),
+            input_cursor_to_end: false,
+            at_prompt: false,
+            history_index: None,
+            history_draft: String::new(),
+            shell_marker: None,
             command_marker: Vec::new(),
             parser: vt100::Parser::new(size.rows, size.cols, 10_000),
             receiver: Some(receiver),
@@ -210,12 +241,23 @@ impl TerminalSession {
             match receiver.try_recv() {
                 Ok(bytes) => {
                     *budget -= 1;
-                    if self.host.is_none() {
-                        extract_command_markers(
-                            &mut self.command_marker,
-                            &bytes,
-                            &mut self.commands,
-                        );
+                    if let Some(prefix) = &self.shell_marker {
+                        for marker in
+                            extract_shell_markers(&mut self.command_marker, &bytes, prefix)
+                        {
+                            match marker {
+                                ShellMarker::Prompt => {
+                                    self.at_prompt = true;
+                                    self.history_index = None;
+                                }
+                                ShellMarker::Command(command) => {
+                                    self.at_prompt = false;
+                                    if !command.is_empty() {
+                                        push_command(&mut self.commands, command);
+                                    }
+                                }
+                            }
+                        }
                     }
                     self.parser.process(&bytes);
                     self.finish_connection_if_ready();
@@ -223,6 +265,7 @@ impl TerminalSession {
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.state = SessionState::Disconnected;
+                    self.at_prompt = false;
                     // Never replay a queued command on some later reconnect.
                     self.pending_commands.clear();
                     self.receiver = None;
@@ -495,6 +538,84 @@ impl TerminalSession {
         }
     }
 
+    /// True while an integrated shell waits at its prompt, so the command
+    /// editor owns the input instead of the shell's line editor.
+    pub fn editor_active(&self) -> bool {
+        self.at_prompt && self.state == SessionState::Connected && !self.screen().alternate_screen()
+    }
+
+    pub fn command_input_mut(&mut self) -> &mut String {
+        &mut self.command_input
+    }
+
+    pub fn take_command_input(&mut self) -> String {
+        self.history_index = None;
+        self.history_draft.clear();
+        std::mem::take(&mut self.command_input)
+    }
+
+    pub fn insert_command_input(&mut self, text: &str) {
+        self.command_input.push_str(text);
+        self.input_cursor_to_end = true;
+    }
+
+    pub fn take_input_cursor_to_end(&mut self) -> bool {
+        std::mem::take(&mut self.input_cursor_to_end)
+    }
+
+    /// Steps the command editor through this session's command history.
+    pub fn recall_command(&mut self, older: bool) {
+        let count = self.commands.len();
+        let next = match (self.history_index, older) {
+            (None, true) => count.checked_sub(1),
+            (Some(index), true) => Some(index.saturating_sub(1)),
+            (Some(index), false) if index + 1 < count => Some(index + 1),
+            _ => None,
+        };
+        if self.history_index.is_none() {
+            if next.is_none() {
+                return;
+            }
+            self.history_draft = std::mem::take(&mut self.command_input);
+        }
+        self.command_input = match next {
+            Some(index) => self.commands[index].clone(),
+            None => std::mem::take(&mut self.history_draft),
+        };
+        self.history_index = next;
+        self.input_cursor_to_end = true;
+    }
+
+    /// Scrolls the screen up until `rows` rows are free below the cursor,
+    /// keeping the cursor on its own line. The shell only moves relative to
+    /// the cursor, so it does not notice.
+    pub fn reserve_rows_below_cursor(&mut self, rows: u16) {
+        let screen_rows = self.screen().size().0;
+        let (row, col) = self.screen().cursor_position();
+        let missing = rows
+            .saturating_sub(screen_rows.saturating_sub(row + 1))
+            .min(row);
+        if missing == 0 {
+            return;
+        }
+        let mut bytes = format!("\x1b[{screen_rows};1H").into_bytes();
+        bytes.extend(std::iter::repeat_n(b'\n', usize::from(missing)));
+        bytes.extend(format!("\x1b[{};{}H", row - missing + 1, col + 1).into_bytes());
+        self.parser.process(&bytes);
+    }
+
+    /// Sends editor input to the shell and gives the shell the keyboard until
+    /// its next prompt.
+    pub fn hand_off(&mut self, bytes: &[u8]) {
+        self.scroll_to_live();
+        self.at_prompt = false;
+        self.history_index = None;
+        self.history_draft.clear();
+        if !self.try_send(bytes) {
+            self.state = SessionState::Disconnected;
+        }
+    }
+
     /// Keeps an open tab pointing at a host that was edited or renamed. If the
     /// edit changes where SSH connects, the tab is disconnected so it can never
     /// be labelled as one server while still talking to another.
@@ -690,9 +811,14 @@ fn prepare_zsh_environment() -> Option<PathBuf> {
         .join("zsh");
     fs::create_dir_all(&directory).ok()?;
 
-    for name in [".zshenv", ".zprofile"] {
-        write_if_changed(&directory.join(name), &forwarding_file(name)).ok()?;
-    }
+    // Take the marker token out of the environment before any user startup
+    // file runs, so nothing those files launch can inherit it.
+    let zshenv = format!(
+        "if [[ -n ${{SHELLHOPPER_MARKER_TOKEN-}} ]]; then\n  typeset -g _shellhopper_token=$SHELLHOPPER_MARKER_TOKEN\n  unset SHELLHOPPER_MARKER_TOKEN\nfi\n{}",
+        forwarding_file(".zshenv")
+    );
+    write_if_changed(&directory.join(".zshenv"), &zshenv).ok()?;
+    write_if_changed(&directory.join(".zprofile"), &forwarding_file(".zprofile")).ok()?;
     // .zlogin is the last startup file, so it hands ZDOTDIR back to the user. From
     // then on history, .zlogout and anything a tool appends go to their own files.
     let zlogin = format!(
@@ -747,19 +873,30 @@ fn contains_search(text: &str, query: &str) -> bool {
         .contains(&query.to_ascii_lowercase())
 }
 
-fn extract_command_markers(buffer: &mut Vec<u8>, bytes: &[u8], commands: &mut Vec<String>) {
+#[derive(Debug, Eq, PartialEq)]
+enum ShellMarker {
+    Prompt,
+    Command(String),
+}
+
+fn shell_marker_prefix(token: &str) -> Vec<u8> {
+    format!("\x1b]1337;ShellHopper{token};").into_bytes()
+}
+
+fn extract_shell_markers(buffer: &mut Vec<u8>, bytes: &[u8], prefix: &[u8]) -> Vec<ShellMarker> {
+    let mut markers = Vec::new();
     buffer.extend_from_slice(bytes);
     loop {
-        let Some(start) = find_bytes(buffer, COMMAND_MARKER) else {
-            let keep = (1..COMMAND_MARKER.len().min(buffer.len() + 1))
+        let Some(start) = find_bytes(buffer, prefix) else {
+            let keep = (1..prefix.len().min(buffer.len() + 1))
                 .rev()
-                .find(|length| buffer.ends_with(&COMMAND_MARKER[..*length]))
+                .find(|length| buffer.ends_with(&prefix[..*length]))
                 .unwrap_or(0);
             buffer.drain(..buffer.len().saturating_sub(keep));
-            return;
+            return markers;
         };
         buffer.drain(..start);
-        let payload_start = COMMAND_MARKER.len();
+        let payload_start = prefix.len();
         let Some(end) = buffer[payload_start..]
             .iter()
             .position(|byte| *byte == b'\x07')
@@ -769,13 +906,18 @@ fn extract_command_markers(buffer: &mut Vec<u8>, bytes: &[u8], commands: &mut Ve
             if buffer.len() > COMMAND_MARKER_LIMIT {
                 buffer.clear();
             }
-            return;
+            return markers;
         };
-        let command = decode_command_marker(&buffer[payload_start..end]);
-        buffer.drain(..=end);
-        if let Some(command) = command.filter(|command| !command.is_empty()) {
-            push_command(commands, command);
+        let payload = &buffer[payload_start..end];
+        if payload == PROMPT_PAYLOAD {
+            markers.push(ShellMarker::Prompt);
+        } else if let Some(command) = payload
+            .strip_prefix(COMMAND_PAYLOAD)
+            .and_then(decode_command_marker)
+        {
+            markers.push(ShellMarker::Command(command));
         }
+        buffer.drain(..=end);
     }
 }
 
@@ -819,8 +961,8 @@ fn decode_command_marker(payload: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionState, TerminalSession, extract_command_markers, scp_command, scp_destination,
-        ssh_command,
+        SessionState, ShellMarker, TerminalSession, extract_shell_markers, scp_command,
+        scp_destination, shell_marker_prefix, ssh_command,
     };
     use crate::config::SshHost;
     use eframe::egui::Context;
@@ -918,21 +1060,87 @@ mod tests {
     #[test]
     fn command_markers_survive_chunks_and_decode_shell_text() {
         let mut buffer = Vec::new();
-        let mut commands = Vec::new();
 
-        extract_command_markers(
-            &mut buffer,
-            b"prompt\x1b]1337;ShellHopperCom",
-            &mut commands,
-        );
-        extract_command_markers(
-            &mut buffer,
-            b"mand=printf 'one\\\\ntwo'\\nnext\x07output",
-            &mut commands,
-        );
+        let prefix = shell_marker_prefix("token");
 
-        assert_eq!(commands, ["printf 'one\\ntwo'\nnext"]);
+        let mut markers = extract_shell_markers(
+            &mut buffer,
+            b"prompt\x1b]1337;ShellHoppertoken;Com",
+            &prefix,
+        );
+        markers.extend(extract_shell_markers(
+            &mut buffer,
+            b"mand=printf 'one\\\\ntwo'\\nnext\x07output\x1b]1337;ShellHoppertoken;Prompt\x07% ",
+            &prefix,
+        ));
+
+        assert_eq!(
+            markers,
+            [
+                ShellMarker::Command("printf 'one\\ntwo'\nnext".into()),
+                ShellMarker::Prompt,
+            ]
+        );
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn reserves_rows_below_the_prompt_without_losing_output() {
+        let mut session =
+            TerminalSession::restored_ssh(1, &SshHost::default(), &Context::default());
+        session.resize(4, 20);
+        session.parser.process(b"one\r\ntwo\r\nthree\r\n% ");
+
+        session.reserve_rows_below_cursor(1);
+        assert_eq!(session.screen().cursor_position(), (2, 2));
+        session.reserve_rows_below_cursor(1);
+        assert_eq!(session.screen().cursor_position(), (2, 2));
+
+        session.reserve_rows_below_cursor(2);
+        assert_eq!(session.screen().cursor_position(), (1, 2));
+        assert_eq!(session.screen().contents(), "three\n% ");
+        assert_eq!(session.history_rows(), 2);
+
+        session.reserve_rows_below_cursor(9);
+        assert_eq!(session.screen().cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn markers_without_the_session_token_are_ignored() {
+        let mut buffer = Vec::new();
+        let prefix = shell_marker_prefix("secret");
+
+        let markers = extract_shell_markers(
+            &mut buffer,
+            b"\x1b]1337;ShellHopperPrompt\x07\x1b]1337;ShellHopperguess;Prompt\x07\x1b]1337;ShellHopper;Command=rm\x07",
+            &prefix,
+        );
+
+        assert!(markers.is_empty());
+    }
+
+    #[test]
+    fn command_editor_follows_prompt_markers_and_recalls_history() {
+        let mut session =
+            TerminalSession::restored_ssh(1, &SshHost::default(), &Context::default());
+        session.state = SessionState::Connected;
+        assert!(!session.editor_active());
+        session.at_prompt = true;
+        assert!(session.editor_active());
+
+        session.commands = vec!["first".into(), "second".into()];
+        session.command_input_mut().push_str("draft");
+        session.recall_command(true);
+        assert_eq!(session.command_input, "second");
+        session.recall_command(true);
+        session.recall_command(true);
+        assert_eq!(session.command_input, "first");
+        session.recall_command(false);
+        session.recall_command(false);
+        assert_eq!(session.command_input, "draft");
+
+        session.hand_off(b"");
+        assert!(!session.editor_active());
     }
 
     #[test]

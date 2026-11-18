@@ -71,6 +71,7 @@ Choose **Manage saved commands…** to add, rename, reorder, or remove commands.
 - Truecolor, alternate screens, mouse reporting, bracketed paste, application cursor keys, and scrollback.
 - Proper support for interactive tools such as `vim`, `less`, history search, and terminal mouse applications.
 - Searchable terminal output and a command list for the current session.
+- A command editor in local zsh tabs with word selection, type-to-replace, cut, copy, and paste. SSH panes and other shells keep standard terminal input for now. Long lines wrap at the pane edge; turn that off with **ShellHopper › Settings › Word Wrap** to keep each line on one row and scroll sideways instead.
 - Command-clickable URLs and local paths.
 
 ### Practical Mac integration
@@ -119,6 +120,10 @@ An existing TermiSlop configuration is copied into the new location on first lau
 | `⌘K` | Clear the active terminal and scrollback |
 | `⌘D` | Split the active pane right |
 | `⌘⇧D` | Split the active pane down |
+| `⌘A` | Select the command editor's text, or all terminal output while a program is running |
+| `↑` / `↓` | Step through this session's commands in the command editor |
+| `⇧Enter` | Add a line to the command in the command editor |
+| `Tab` | Hand the typed command to zsh for completion |
 | `⌘↓` | Return to live output |
 | `⇧Page Up` / `⇧Page Down` | Move through scrollback |
 | `⌘` + click a URL or local path | Open it with the default macOS app |
