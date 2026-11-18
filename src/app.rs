@@ -2151,10 +2151,13 @@ impl ShellHopperApp {
         let history_rows = session.history_rows();
         let selection = self
             .terminal_selection
-            .as_ref()
             .filter(|selection| selection.session_id == id);
-        let terminal =
-            terminal_layout(session.screen(), search.as_deref(), history_rows, selection);
+        let terminal = terminal_layout(
+            session.screen(),
+            search.as_deref(),
+            history_rows,
+            selection.as_ref(),
+        );
         let screen = session.screen();
         let application_cursor = screen.application_cursor();
         let bracketed_paste = screen.bracketed_paste();
@@ -2170,6 +2173,7 @@ impl ShellHopperApp {
         let mut split = None;
         let mut close = false;
         let mut copy_selection = false;
+        let mut delete_selection = false;
         let mut paste_from_clipboard = false;
         let mut paste_saved_command = None;
         let mut manage_saved_commands = false;
@@ -2472,9 +2476,13 @@ impl ShellHopperApp {
                     }) {
                         copy_selection = true;
                     }
-                    handle_terminal_input(ctx, session, input_state);
+                    delete_selection =
+                        handle_terminal_input(ctx, session, input_state, selection, history_rows);
                 }
             });
+        if delete_selection {
+            self.terminal_selection = None;
+        }
         if copy_selection
             && let Some(selection) = self
                 .terminal_selection
@@ -3419,7 +3427,10 @@ fn handle_terminal_input(
     ctx: &egui::Context,
     session: &mut TerminalSession,
     state: TerminalInputState,
-) {
+    mut selection: Option<TerminalSelection>,
+    history_rows: usize,
+) -> bool {
+    let mut deleted_selection = false;
     let events = ctx.input(|input| input.events.clone());
     for event in events {
         match event {
@@ -3443,6 +3454,23 @@ fn handle_terminal_input(
                 }
                 if !state.alternate_screen && modifiers.shift && key == Key::PageDown {
                     session.scroll_page(false);
+                    continue;
+                }
+                if matches!(key, Key::Backspace | Key::Delete)
+                    && modifiers == egui::Modifiers::NONE
+                    && let Some(bytes) = selection.and_then(|selection| {
+                        terminal_selection_delete_sequence(
+                            session.screen(),
+                            selection,
+                            history_rows,
+                            state.application_cursor,
+                        )
+                    })
+                {
+                    session.scroll_to_live();
+                    session.send(&bytes);
+                    selection = None;
+                    deleted_selection = true;
                     continue;
                 }
                 if let Some(bytes) = terminal_key_sequence(key, modifiers, state.application_cursor)
@@ -3537,6 +3565,42 @@ fn handle_terminal_input(
             _ => {}
         }
     }
+    deleted_selection
+}
+
+fn terminal_selection_delete_sequence(
+    screen: &vt100::Screen,
+    selection: TerminalSelection,
+    history_rows: usize,
+    application_cursor: bool,
+) -> Option<Vec<u8>> {
+    if selection.dragging || screen.scrollback() != 0 || screen.alternate_screen() {
+        return None;
+    }
+    let (start, end) = selection.range();
+    let (screen_row, cursor_col) = screen.cursor_position();
+    let cursor_row = history_rows + usize::from(screen_row);
+    // shortcut: only same-row text before the cursor is editable, add shell-buffer tracking for wrapped input.
+    if start.row != cursor_row || end.row != cursor_row || end.col > cursor_col {
+        return None;
+    }
+    let characters = |from, to| {
+        (from..to)
+            .filter(|col| {
+                !screen
+                    .cell(screen_row, *col)
+                    .is_some_and(vt100::Cell::is_wide_continuation)
+            })
+            .count()
+    };
+    let delete_count = characters(start.col, end.col);
+    if delete_count == 0 {
+        return None;
+    }
+    let left = terminal_key_sequence(Key::ArrowLeft, egui::Modifiers::NONE, application_cursor)?;
+    let mut bytes = left.repeat(characters(end.col, cursor_col));
+    bytes.extend(vec![b'\x7f'; delete_count]);
+    Some(bytes)
 }
 
 fn paste_sequence(text: &str, bracketed: bool) -> Vec<u8> {
@@ -4135,6 +4199,24 @@ mod terminal_color_tests {
         );
         assert!(selection.contains(3, 0));
         assert!(!selection.contains(4, 8));
+    }
+
+    #[test]
+    fn deletes_highlighted_text_from_the_current_input_line() {
+        let mut parser = vt100::Parser::new(2, 24, 0);
+        parser.process(b"$ abcdef");
+        let selection = TerminalSelection {
+            session_id: 1,
+            anchor: TerminalPoint { row: 0, col: 4 },
+            head: TerminalPoint { row: 0, col: 7 },
+            cols: 24,
+            dragging: false,
+        };
+
+        assert_eq!(
+            terminal_selection_delete_sequence(parser.screen(), selection, 0, false),
+            Some(b"\x1b[D\x7f\x7f\x7f".to_vec())
+        );
     }
 
     #[test]
