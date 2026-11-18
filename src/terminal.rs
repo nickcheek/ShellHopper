@@ -255,17 +255,19 @@ impl TerminalSession {
         &mut self,
         start_row: usize,
         start_col: u16,
-        end_row: usize,
-        end_col: u16,
+        mut end_row: usize,
+        mut end_col: u16,
     ) -> String {
         let original = self.scrollback();
         let history_rows = self.history_rows();
         let (screen_rows, cols) = self.screen().size();
         let total_rows = history_rows + usize::from(screen_rows);
-        if start_row >= total_rows
-            || end_row >= total_rows
-            || (start_row, start_col) >= (end_row, end_col)
-        {
+        if end_row >= total_rows {
+            let (cursor_row, cursor_col) = self.screen().cursor_position();
+            end_row = history_rows + usize::from(cursor_row);
+            end_col = cursor_col;
+        }
+        if start_row >= total_rows || (start_row, start_col) >= (end_row, end_col) {
             return String::new();
         }
 
@@ -831,6 +833,7 @@ mod tests {
         session.parser.process(b"alpha\r\nbeta");
 
         assert_eq!(session.selection_text(0, 1, 1, 3), "lpha\nbet");
+        assert_eq!(session.selection_text(0, 0, usize::MAX, 0), "alpha\nbeta");
     }
 
     #[test]
