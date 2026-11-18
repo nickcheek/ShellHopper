@@ -253,8 +253,8 @@ impl TerminalSession {
 
     pub fn selection_text(
         &mut self,
-        start_row: usize,
-        start_col: u16,
+        mut start_row: usize,
+        mut start_col: u16,
         mut end_row: usize,
         mut end_col: u16,
     ) -> String {
@@ -272,33 +272,38 @@ impl TerminalSession {
         }
 
         let mut text = String::new();
-        let last_row = if end_col == 0 && end_row > start_row {
-            end_row - 1
-        } else {
-            end_row
-        };
-        for row in start_row..=last_row {
-            let (offset, visible_row) = if row < history_rows {
-                (history_rows - row, 0)
+        while (start_row, start_col) < (end_row, end_col) {
+            let (offset, visible_start) = if start_row < history_rows {
+                (history_rows - start_row, 0)
             } else {
-                (0, (row - history_rows) as u16)
+                (0, (start_row - history_rows) as u16)
             };
             let screen = self.parser.screen_mut();
             screen.set_scrollback(offset);
-            let from = if row == start_row {
-                start_col.min(cols)
-            } else {
-                0
-            };
-            let to = if row == end_row {
-                end_col.min(cols)
-            } else {
-                cols
-            };
-            text.push_str(&screen.contents_between(visible_row, from, visible_row, to));
-            if row < end_row && !screen.row_wrapped(visible_row) {
+            let visible_rows = usize::from(screen_rows - visible_start);
+            let remaining_rows = end_row - start_row;
+            if remaining_rows < visible_rows {
+                text.push_str(&screen.contents_between(
+                    visible_start,
+                    start_col.min(cols),
+                    visible_start + remaining_rows as u16,
+                    end_col.min(cols),
+                ));
+                break;
+            }
+
+            let visible_end = screen_rows - 1;
+            text.push_str(&screen.contents_between(
+                visible_start,
+                start_col.min(cols),
+                visible_end,
+                cols,
+            ));
+            if !screen.row_wrapped(visible_end) {
                 text.push('\n');
             }
+            start_row += visible_rows;
+            start_col = 0;
         }
         self.parser.screen_mut().set_scrollback(original);
         text
@@ -834,6 +839,23 @@ mod tests {
 
         assert_eq!(session.selection_text(0, 1, 1, 3), "lpha\nbet");
         assert_eq!(session.selection_text(0, 0, usize::MAX, 0), "alpha\nbeta");
+    }
+
+    #[test]
+    fn copies_a_selection_larger_than_the_terminal_viewport() {
+        let mut session =
+            TerminalSession::restored_ssh(1, &SshHost::default(), &Context::default());
+        let output = (0..60)
+            .map(|line| format!("line-{line:02}"))
+            .collect::<Vec<_>>();
+        session.parser.process(output.join("\r\n").as_bytes());
+        let history_rows = session.history_rows();
+        let (cursor_row, cursor_col) = session.screen().cursor_position();
+
+        assert_eq!(
+            session.selection_text(0, 0, history_rows + usize::from(cursor_row), cursor_col,),
+            output.join("\n")
+        );
     }
 
     #[test]

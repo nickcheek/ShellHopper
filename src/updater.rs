@@ -35,12 +35,23 @@ enum UpdateState {
 enum UpdateEvent {
     Downloading(String),
     Ready(PreparedUpdate),
-    Current { manual: bool },
-    Failed { error: String, manual: bool },
+    ReadyForInstall(PreparedUpdate),
+    RefreshFailed {
+        update: PreparedUpdate,
+        error: String,
+    },
+    Current {
+        manual: bool,
+    },
+    Failed {
+        error: String,
+        manual: bool,
+    },
 }
 
 pub enum UpdateNotice {
     Current,
+    Ready,
     Failed(String),
 }
 
@@ -71,7 +82,7 @@ impl Updater {
         let sender = self.sender.clone();
         let ctx = self.ctx.clone();
         thread::spawn(move || {
-            let event = match prepare_update(&sender, &ctx) {
+            let event = match prepare_update(&sender, &ctx, env!("CARGO_PKG_VERSION")) {
                 Ok(Some(update)) => UpdateEvent::Ready(update),
                 Ok(None) => UpdateEvent::Current { manual },
                 Err(error) => UpdateEvent::Failed { error, manual },
@@ -99,6 +110,16 @@ impl Updater {
                 UpdateEvent::Ready(update) => {
                     self.last_check = Some(Instant::now());
                     self.state = UpdateState::Ready(update);
+                }
+                UpdateEvent::ReadyForInstall(update) => {
+                    self.last_check = Some(Instant::now());
+                    self.state = UpdateState::Ready(update);
+                    notice = Some(UpdateNotice::Ready);
+                }
+                UpdateEvent::RefreshFailed { update, error } => {
+                    self.last_check = Some(Instant::now());
+                    self.state = UpdateState::Ready(update);
+                    notice = Some(UpdateNotice::Failed(error));
                 }
                 UpdateEvent::Current { manual } => {
                     self.last_check = Some(Instant::now());
@@ -134,6 +155,32 @@ impl Updater {
         }
     }
 
+    pub fn prepare_to_install(&mut self) {
+        let UpdateState::Ready(current) = std::mem::replace(&mut self.state, UpdateState::Idle)
+        else {
+            return;
+        };
+        self.state = UpdateState::Checking;
+        let current_version = current.version.clone();
+        let sender = self.sender.clone();
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let event = match prepare_update(&sender, &ctx, &current_version) {
+                Ok(Some(update)) => {
+                    let _ = fs::remove_dir_all(&current.staged_app);
+                    UpdateEvent::ReadyForInstall(update)
+                }
+                Ok(None) => UpdateEvent::ReadyForInstall(current),
+                Err(error) => UpdateEvent::RefreshFailed {
+                    update: current,
+                    error,
+                },
+            };
+            let _ = sender.send(event);
+            ctx.request_repaint();
+        });
+    }
+
     pub fn install_and_relaunch(&mut self) -> Result<(), String> {
         let UpdateState::Ready(update) = std::mem::replace(&mut self.state, UpdateState::Idle)
         else {
@@ -161,6 +208,7 @@ impl PreparedUpdate {
 fn prepare_update(
     sender: &Sender<UpdateEvent>,
     ctx: &Context,
+    current_version: &str,
 ) -> Result<Option<PreparedUpdate>, String> {
     let installed_app = installed_bundle()?;
     let temp = TempDirectory::new()?;
@@ -171,7 +219,7 @@ fn prepare_update(
     let tag = json_string_field(&release, "tag_name")
         .ok_or_else(|| "GitHub's release response did not include a version.".to_owned())?;
     let version = tag.strip_prefix('v').unwrap_or(&tag);
-    if !is_newer_version(version, env!("CARGO_PKG_VERSION"))? {
+    if !is_newer_version(version, current_version)? {
         return Ok(None);
     }
 

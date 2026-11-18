@@ -952,10 +952,13 @@ impl ShellHopperApp {
         #[cfg(target_os = "macos")]
         {
             if let Some(notice) = self.updater.poll() {
-                self.message = Some(match notice {
-                    UpdateNotice::Current => "ShellHopper is up to date.".into(),
-                    UpdateNotice::Failed(error) => error,
-                });
+                match notice {
+                    UpdateNotice::Current => {
+                        self.message = Some("ShellHopper is up to date.".into());
+                    }
+                    UpdateNotice::Ready => self.show_update_confirmation = true,
+                    UpdateNotice::Failed(error) => self.message = Some(error),
+                }
             }
             self.updater.check_if_due();
         }
@@ -1731,7 +1734,7 @@ impl ShellHopperApp {
 
                 #[cfg(target_os = "macos")]
                 if update {
-                    self.show_update_confirmation = true;
+                    self.updater.prepare_to_install();
                 }
 
                 if let Some(id) = activate {
@@ -3577,30 +3580,88 @@ fn terminal_selection_delete_sequence(
     if selection.dragging || screen.scrollback() != 0 || screen.alternate_screen() {
         return None;
     }
-    let (start, end) = selection.range();
+    let (start, mut end) = selection.range();
     let (screen_row, cursor_col) = screen.cursor_position();
-    let cursor_row = history_rows + usize::from(screen_row);
-    // shortcut: only same-row text before the cursor is editable, add shell-buffer tracking for wrapped input.
-    if start.row != cursor_row || end.row != cursor_row || end.col > cursor_col {
+    let cursor = TerminalPoint {
+        row: history_rows + usize::from(screen_row),
+        col: cursor_col,
+    };
+    let mut first_row = screen_row;
+    while first_row > 0 && screen.row_wrapped(first_row - 1) {
+        first_row -= 1;
+    }
+    let mut last_row = screen_row;
+    while last_row + 1 < screen.size().0 && screen.row_wrapped(last_row) {
+        last_row += 1;
+    }
+    let editable_start = history_rows + usize::from(first_row);
+    let editable_end = history_rows + usize::from(last_row);
+    if start.row < editable_start || end.row > editable_end {
         return None;
     }
-    let characters = |from, to| {
-        (from..to)
-            .filter(|col| {
-                !screen
-                    .cell(screen_row, *col)
-                    .is_some_and(vt100::Cell::is_wide_continuation)
+
+    // shortcut: terminal cells approximate the shell buffer; add shell integration if tabs need exact ranges.
+    let rendered_end = (first_row..=last_row)
+        .rev()
+        .find_map(|row| {
+            (0..screen.size().1).rev().find_map(|col| {
+                screen
+                    .cell(row, col)
+                    .filter(|cell| !cell.contents().is_empty())
+                    .map(|_| TerminalPoint {
+                        row: history_rows + usize::from(row),
+                        col: col + 1,
+                    })
             })
-            .count()
-    };
-    let delete_count = characters(start.col, end.col);
+        })
+        .unwrap_or(cursor)
+        .max(cursor);
+    end = end.min(rendered_end);
+    if start >= end {
+        return None;
+    }
+
+    let characters = |from, to| terminal_character_count(screen, history_rows, from, to);
+    let delete_count = characters(start, end);
     if delete_count == 0 {
         return None;
     }
-    let left = terminal_key_sequence(Key::ArrowLeft, egui::Modifiers::NONE, application_cursor)?;
-    let mut bytes = left.repeat(characters(end.col, cursor_col));
+
+    let mut bytes = if end < cursor {
+        terminal_key_sequence(Key::ArrowLeft, egui::Modifiers::NONE, application_cursor)?
+            .repeat(characters(end, cursor))
+    } else {
+        terminal_key_sequence(Key::ArrowRight, egui::Modifiers::NONE, application_cursor)?
+            .repeat(characters(cursor, end))
+    };
     bytes.extend(vec![b'\x7f'; delete_count]);
     Some(bytes)
+}
+
+fn terminal_character_count(
+    screen: &vt100::Screen,
+    history_rows: usize,
+    start: TerminalPoint,
+    end: TerminalPoint,
+) -> usize {
+    (start.row..=end.row)
+        .map(|row| {
+            let screen_row = u16::try_from(row.saturating_sub(history_rows)).unwrap_or(u16::MAX);
+            let from = if row == start.row { start.col } else { 0 };
+            let to = if row == end.row {
+                end.col
+            } else {
+                screen.size().1
+            };
+            (from..to)
+                .filter(|col| {
+                    !screen
+                        .cell(screen_row, *col)
+                        .is_some_and(vt100::Cell::is_wide_continuation)
+                })
+                .count()
+        })
+        .sum()
 }
 
 fn paste_sequence(text: &str, bracketed: bool) -> Vec<u8> {
@@ -4202,20 +4263,20 @@ mod terminal_color_tests {
     }
 
     #[test]
-    fn deletes_highlighted_text_from_the_current_input_line() {
-        let mut parser = vt100::Parser::new(2, 24, 0);
-        parser.process(b"$ abcdef");
+    fn deletes_highlighted_text_around_the_terminal_cursor() {
+        let mut parser = vt100::Parser::new(2, 8, 0);
+        parser.process(b"$ abcdefghi\x1b[2D");
         let selection = TerminalSelection {
             session_id: 1,
-            anchor: TerminalPoint { row: 0, col: 4 },
-            head: TerminalPoint { row: 0, col: 7 },
-            cols: 24,
+            anchor: TerminalPoint { row: 0, col: 6 },
+            head: TerminalPoint { row: 1, col: 2 },
+            cols: 8,
             dragging: false,
         };
 
         assert_eq!(
             terminal_selection_delete_sequence(parser.screen(), selection, 0, false),
-            Some(b"\x1b[D\x7f\x7f\x7f".to_vec())
+            Some(b"\x1b[C\x7f\x7f\x7f\x7f".to_vec())
         );
     }
 

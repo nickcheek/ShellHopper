@@ -106,6 +106,7 @@ impl MenuBar {
         self.add_action("Show ShellHopper", MenuBarAction::Show);
         self.add_action("New Local Terminal", MenuBarAction::NewLocal);
         self.add_action("Check for Updates…", MenuBarAction::CheckForUpdates);
+        self.add_update_action_to_app_menu();
         self.menu
             .addItem(&NSMenuItem::separatorItem(MainThreadMarker::new().unwrap()));
 
@@ -170,6 +171,24 @@ impl MenuBar {
         Self::add_action_to(&self.menu, &self.target, &mut self.actions, title, action);
     }
 
+    fn add_update_action_to_app_menu(&mut self) {
+        let mtm = MainThreadMarker::new().unwrap();
+        let Some(menu) = (unsafe {
+            NSApplication::sharedApplication(mtm)
+                .mainMenu()
+                .and_then(|menu| menu.itemAtIndex(0))
+                .and_then(|item| item.submenu())
+        }) else {
+            return;
+        };
+        if let Some(item) = unsafe { menu.itemWithTitle(ns_string!("Check for Updates…")) } {
+            unsafe { menu.removeItem(&item) };
+        }
+        let item = Self::action_item(&self.target, self.actions.len(), "Check for Updates…");
+        self.actions.push(MenuBarAction::CheckForUpdates);
+        unsafe { menu.insertItem_atIndex(&item, 1.min(menu.numberOfItems())) };
+    }
+
     fn add_action_to(
         menu: &NSMenu,
         target: &MenuTarget,
@@ -177,6 +196,12 @@ impl MenuBar {
         title: &str,
         action: MenuBarAction,
     ) {
+        let item = Self::action_item(target, actions.len(), title);
+        actions.push(action);
+        menu.addItem(&item);
+    }
+
+    fn action_item(target: &MenuTarget, tag: usize, title: &str) -> Retained<NSMenuItem> {
         let mtm = MainThreadMarker::new().unwrap();
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -188,9 +213,8 @@ impl MenuBar {
         };
         unsafe {
             item.setTarget(Some(target));
-            item.setTag(actions.len() as isize);
+            item.setTag(tag as isize);
         }
-        actions.push(action);
-        menu.addItem(&item);
+        item
     }
 }
