@@ -860,6 +860,22 @@ impl ShellHopperApp {
             .count()
     }
 
+    /// True while something other than a terminal expects the keyboard.
+    fn dialog_open(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.show_update_confirmation {
+            return true;
+        }
+        self.editor.is_some()
+            || self.saved_commands_editor.is_some()
+            || self.rename_tab.is_some()
+            || self.new_group.is_some()
+            || self.command_history_open
+            || self.terminal_search_open
+            || self.show_quit_confirmation
+            || self.pending_upload.is_some()
+    }
+
     fn save_config(&mut self) {
         if !self.config_writable {
             return;
@@ -1837,8 +1853,15 @@ impl ShellHopperApp {
             });
             return;
         };
-        let request_focus = self.terminal_focus == Some(id);
-        if request_focus {
+        // Nothing else holding the keyboard means the terminal should. Menus,
+        // right-clicks and closed dialogs all leave focus on nothing, and then
+        // typing, copy and paste silently do nothing until the next click.
+        let idle_focus = ctx.memory(|memory| memory.focused().is_none())
+            && !egui::Popup::is_any_open(ctx)
+            && !ctx.input(|input| input.pointer.any_down())
+            && !self.dialog_open();
+        let request_focus = self.terminal_focus == Some(id) || idle_focus;
+        if self.terminal_focus == Some(id) {
             self.terminal_focus = None;
         }
 
@@ -2236,9 +2259,15 @@ impl ShellHopperApp {
             .flatten();
         // The screen rows the command editor covers. Clicks there are the
         // editor's, never the start of an output selection.
+        // While scrolled back the prompt, and so the editor, sits further down
+        // and may be off the bottom of the pane. It is still placed there, so
+        // it keeps the keyboard.
         let editor_band = show_command_editor.then(|| {
             let row = session.screen().cursor_position().0;
-            (row, editor_rows.min(rows.saturating_sub(row)).max(1))
+            (
+                usize::from(row) + session.scrollback(),
+                editor_rows.min(rows.saturating_sub(row)).max(1),
+            )
         });
         let mut collapse_editor_selection = false;
         let reconnectable =
@@ -2276,7 +2305,7 @@ impl ShellHopperApp {
                     egui::Rect::from_min_size(
                         egui::pos2(
                             response.rect.left(),
-                            response.rect.top() + f32::from(row) * row_height,
+                            response.rect.top() + row as f32 * row_height,
                         ),
                         egui::vec2(response.rect.width(), f32::from(count) * row_height),
                     )
@@ -2748,6 +2777,23 @@ impl ShellHopperApp {
                     session.send(b"\x0c");
                 }
                 complete_command = tab && !empty;
+                // With nothing typed there is no command text to select, so
+                // Select All means the output.
+                if empty
+                    && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, Key::A))
+                {
+                    let (cursor_row, cursor_col) = session.screen().cursor_position();
+                    self.terminal_selection = Some(TerminalSelection {
+                        session_id: id,
+                        anchor: TerminalPoint { row: 0, col: 0 },
+                        head: TerminalPoint {
+                            row: history_rows + usize::from(cursor_row),
+                            col: cursor_col,
+                        },
+                        cols,
+                        dragging: false,
+                    });
+                }
                 submit_command = submit;
             }
             // The output selection and the editor selection never coexist, so
@@ -2771,10 +2817,9 @@ impl ShellHopperApp {
                 state.store(ctx, editor_id);
             }
             if let Some(terminal_rect) = terminal_response_rect {
-                let (cursor_row, _) = session.screen().cursor_position();
+                let (band_row, visible_rows) = editor_band.unwrap_or((0, 1));
                 let left = terminal_rect.left() + editor_offset;
-                let top = terminal_rect.top() + f32::from(cursor_row) * row_height;
-                let visible_rows = editor_rows.min(rows.saturating_sub(cursor_row)).max(1);
+                let top = terminal_rect.top() + band_row as f32 * row_height;
                 let editor_rect = egui::Rect::from_min_size(
                     egui::pos2(left, top),
                     egui::vec2(
@@ -2856,6 +2901,9 @@ impl ShellHopperApp {
                     || editor.changed()
                     || editor.clicked()
                     || editor.drag_started();
+                if editor.changed() {
+                    session.scroll_to_live();
+                }
             }
         }
         if editor_touched

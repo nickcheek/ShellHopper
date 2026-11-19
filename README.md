@@ -120,7 +120,7 @@ An existing TermiSlop configuration is copied into the new location on first lau
 | `⌘K` | Clear the active terminal and scrollback |
 | `⌘D` | Split the active pane right |
 | `⌘⇧D` | Split the active pane down |
-| `⌘A` | Select the command editor's text, or all terminal output while a program is running |
+| `⌘A` | Select the command editor's text, or all terminal output when the editor is empty or a program is running |
 | `↑` / `↓` | Step through this session's commands in the command editor |
 | `⇧Enter` | Add a line to the command in the command editor |
 | `Tab` | Hand the typed command to zsh for completion |
