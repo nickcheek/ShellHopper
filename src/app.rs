@@ -2741,15 +2741,30 @@ impl ShellHopperApp {
                     })
             });
             if ctx.memory(|memory| memory.has_focus(editor_id)) {
-                // In a multi-line command the arrows move between its lines.
-                let single_line = !session.command_input_mut().contains('\n');
+                let untouched = session.recalled_command_untouched();
+                let job = command_editor_job(
+                    session.command_input_mut().as_str(),
+                    editor_indent,
+                    editor_wrap_width,
+                );
+                let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+                let cursor = egui::TextEdit::load_state(ctx, editor_id)
+                    .and_then(|state| state.cursor.char_range())
+                    .map_or(galley.end(), |range| range.primary);
+                let cursor_row = galley.layout_from_cursor(cursor).row;
+                let recall_older = cursor_row == 0 || (untouched && cursor == galley.end());
+                let recall_newer = cursor_row + 1 >= galley.rows.len();
                 let (submit, older, newer, tab, interrupt, end_of_input, clear) =
                     ctx.input_mut(|input| {
                         (
                             !input.modifiers.shift
                                 && input.consume_key(egui::Modifiers::NONE, Key::Enter),
-                            single_line && input.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
-                            single_line && input.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                            recall_older
+                                && input.modifiers.is_none()
+                                && input.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                            recall_newer
+                                && input.modifiers.is_none()
+                                && input.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
                             input.consume_key(egui::Modifiers::NONE, Key::Tab),
                             input.consume_key(egui::Modifiers::CTRL, Key::C),
                             input.consume_key(egui::Modifiers::CTRL, Key::D),

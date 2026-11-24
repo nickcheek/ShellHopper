@@ -586,6 +586,12 @@ impl TerminalSession {
         self.input_cursor_to_end = true;
     }
 
+    pub fn recalled_command_untouched(&self) -> bool {
+        self.history_index
+            .and_then(|index| self.commands.get(index))
+            .is_some_and(|command| *command == self.command_input)
+    }
+
     /// Scrolls the screen up until `rows` rows are free below the cursor,
     /// keeping the cursor on its own line. The shell only moves relative to
     /// the cursor, so it does not notice.
@@ -1138,6 +1144,15 @@ mod tests {
         session.recall_command(false);
         session.recall_command(false);
         assert_eq!(session.command_input, "draft");
+
+        session.commands = vec!["first".into(), "one\ntwo".into()];
+        session.recall_command(true);
+        assert_eq!(session.command_input, "one\ntwo");
+        assert!(session.recalled_command_untouched());
+        session.command_input_mut().push('!');
+        assert!(!session.recalled_command_untouched());
+        session.recall_command(true);
+        assert_eq!(session.command_input, "first");
 
         session.hand_off(b"");
         assert!(!session.editor_active());
