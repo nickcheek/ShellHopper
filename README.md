@@ -70,7 +70,7 @@ Choose **Manage saved commands…** to add, rename, reorder, or remove commands.
 - Tabs and recursively nested split panes that preserve independent terminal sessions.
 - Truecolor, alternate screens, mouse reporting, bracketed paste, application cursor keys, and scrollback.
 - Proper support for interactive tools such as `vim`, `less`, history search, and terminal mouse applications.
-- Searchable terminal output and a command list for the current session.
+- Searchable terminal output and a command list for each pane. Local zsh panes start with up to 1,000 commands from your existing zsh history. Press Up at a fresh prompt to recall the most recent command, including a multiline command.
 - A command editor in local zsh tabs with word selection, type-to-replace, cut, copy, and paste. SSH panes and other shells keep standard terminal input for now. Long lines wrap at the pane edge; turn that off with **ShellHopper › Settings › Word Wrap** to keep each line on one row and scroll sideways instead.
 - Command-clickable URLs and local paths.
 

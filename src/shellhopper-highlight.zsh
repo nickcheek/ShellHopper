@@ -53,6 +53,28 @@ add-zle-hook-widget line-init _shellhopper_syntax_highlight
 add-zle-hook-widget line-pre-redraw _shellhopper_syntax_highlight
 add-zsh-hook preexec _shellhopper_record_command
 
+# A pane can close without a normal shell exit. Use zsh's incremental writes
+# unless the user already has a different incremental history mode enabled.
+if [[ -n $HISTFILE && $SAVEHIST -gt 0 && ! -o sharehistory && ! -o incappendhistorytime ]]; then
+  setopt incappendhistory
+fi
+
+_shellhopper_load_history() {
+  emulate -L zsh
+  add-zsh-hook -d precmd _shellhopper_load_history
+  [[ -n $_shellhopper_token ]] || return 0
+  zmodload zsh/parameter || return 0
+  local -a events
+  local event
+  events=( ${(onk)history} )
+  # Send the newest COMMAND_HISTORY_LIMIT entries oldest first, before Prompt.
+  local -i offset=$(( ${#events} > 1000 ? ${#events} - 1000 : 0 ))
+  for event in "${events[@]:offset}"; do
+    _shellhopper_record_command "${history[$event]}"
+  done
+}
+add-zsh-hook precmd _shellhopper_load_history
+
 _shellhopper_set_buffer() {
   local text
   zle .bracketed-paste text
