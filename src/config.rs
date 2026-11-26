@@ -35,6 +35,48 @@ pub struct AppConfig {
     /// Stored inverted so that word wrap stays on unless it was turned off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_word_wrap: bool,
+    #[serde(default, skip_serializing_if = "PresentationSettings::is_default")]
+    pub presentation: PresentationSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_position: Option<[i32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_size: Option<[u32; 2]>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct PresentationSettings {
+    pub font_size: Option<u8>,
+    pub text_color: [u8; 3],
+    pub background_color: [u8; 3],
+    pub fill_window: bool,
+    pub mask_keys: bool,
+    pub mask_paths: bool,
+    pub hide_host_details: bool,
+    pub show_typing: bool,
+    pub padding: u8,
+}
+
+impl Default for PresentationSettings {
+    fn default() -> Self {
+        Self {
+            font_size: None,
+            text_color: [225, 228, 238],
+            background_color: [13, 14, 18],
+            fill_window: true,
+            mask_keys: true,
+            mask_paths: false,
+            hide_host_details: false,
+            show_typing: true,
+            padding: 8,
+        }
+    }
+}
+
+impl PresentationSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -769,5 +811,24 @@ mod tests {
         assert_eq!(restored.host_separators, config.host_separators);
         assert!(!text.contains("command"));
         assert!(!text.contains("output"));
+    }
+
+    #[test]
+    fn presentation_settings_are_saved_only_when_changed() {
+        let mut config = AppConfig {
+            hosts: vec![SshHost::default()],
+            ..Default::default()
+        };
+        assert!(!toml::to_string(&config).unwrap().contains("presentation"));
+
+        config.presentation.text_color = [0, 255, 0];
+        config.presentation.fill_window = false;
+        let text = toml::to_string(&config).unwrap();
+        let restored: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(restored.presentation, config.presentation);
+
+        let partial: AppConfig = toml::from_str("[presentation]\npadding = 20\n").unwrap();
+        assert_eq!(partial.presentation.padding, 20);
+        assert!(partial.presentation.show_typing);
     }
 }

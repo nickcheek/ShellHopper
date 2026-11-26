@@ -17,6 +17,7 @@ pub enum MenuBarAction {
     NewLocal,
     CheckForUpdates,
     ToggleWordWrap,
+    PresentationSettings,
     OpenHost(String),
     Quit,
 }
@@ -221,6 +222,10 @@ impl MenuBar {
         let state: isize = if config.no_word_wrap { 0 } else { 1 };
         let _: () = unsafe { msg_send![&*word_wrap, setState: state] };
         submenu.addItem(&word_wrap);
+        let presentation =
+            Self::action_item(&self.target, self.actions.len(), "Presentation Mode…");
+        self.actions.push(MenuBarAction::PresentationSettings);
+        submenu.addItem(&presentation);
         settings_item.setSubmenu(Some(&submenu));
         unsafe { menu.insertItem_atIndex(&settings_item, 2.min(menu.numberOfItems())) };
     }

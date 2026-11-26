@@ -69,6 +69,11 @@ pub struct ShellHopperApp {
     pending_upload: Option<PendingUpload>,
     upload: Option<Upload>,
     file_drop_target: Option<u64>,
+    presentation_open: bool,
+    presentation_identities: crate::presentation_mask::Identities,
+    presentation_geometry: Option<(egui::Pos2, egui::Vec2)>,
+    presentation_settings_open: bool,
+    presentation_settings_dirty: bool,
     closed_tabs: Vec<ClosedTab>,
     show_quit_confirmation: bool,
     #[cfg(target_os = "macos")]
@@ -97,6 +102,25 @@ struct TabRename {
 
 #[derive(Clone)]
 struct DraggedGroup(String);
+
+#[derive(Clone, Copy)]
+struct TerminalMetrics {
+    font_size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    foreground: Color32,
+    background: Color32,
+}
+
+impl TerminalMetrics {
+    const DEFAULT: Self = Self {
+        font_size: TERM_FONT_SIZE,
+        line_height: TERM_LINE_HEIGHT,
+        letter_spacing: 0.0,
+        foreground: Color32::from_rgb(225, 228, 238),
+        background: TERMINAL,
+    };
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TerminalPoint {
@@ -442,6 +466,11 @@ impl ShellHopperApp {
             pending_upload: None,
             upload: None,
             file_drop_target: None,
+            presentation_open: false,
+            presentation_identities: Default::default(),
+            presentation_geometry: None,
+            presentation_settings_open: false,
+            presentation_settings_dirty: false,
             closed_tabs: Vec::new(),
             show_quit_confirmation: false,
             #[cfg(target_os = "macos")]
@@ -869,6 +898,7 @@ impl ShellHopperApp {
         self.editor.is_some()
             || self.saved_commands_editor.is_some()
             || self.rename_tab.is_some()
+            || self.presentation_settings_open
             || self.new_group.is_some()
             || self.command_history_open
             || self.terminal_search_open
@@ -1075,6 +1105,7 @@ impl ShellHopperApp {
                 self.config.no_word_wrap = !self.config.no_word_wrap;
                 self.save_config();
             }
+            MenuBarAction::PresentationSettings => self.presentation_settings_open = true,
             MenuBarAction::Quit => {
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -1132,12 +1163,38 @@ impl ShellHopperApp {
                 bottom: 12,
             }))
             .show(root, |ui| {
-                // The strip beside the traffic lights stays empty and moves the window.
                 let (strip, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), TITLEBAR_HEIGHT - 8.0),
                     Sense::hover(),
                 );
-                theme::window_drag_area(ui, strip, "titlebar");
+                let share_rect = egui::Rect::from_center_size(
+                    egui::pos2(strip.right() - 22.0, strip.top() + TITLEBAR_HEIGHT / 2.0),
+                    egui::vec2(40.0, 24.0),
+                );
+                theme::window_drag_area(
+                    ui,
+                    egui::Rect::from_min_max(strip.min, egui::pos2(share_rect.left(), strip.bottom())),
+                    "titlebar",
+                );
+                let sharing = self.presentation_open;
+                let enabled = sharing || self.active_session.is_some();
+                let label = if sharing { "Stop sharing" } else { "Share active pane" };
+                let share = ui.put(share_rect, egui::Button::new("").selected(sharing)
+                    .sense(if enabled { Sense::click() } else { Sense::hover() }))
+                    .on_hover_text(label);
+                share.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, sharing, label));
+                let center = share.rect.center();
+                let icon = egui::Rect::from_center_size(center, egui::vec2(18.0, 14.0));
+                let stroke = Stroke::new(1.5, if sharing { RED } else { MUTED });
+                ui.painter().rect_stroke(icon, 2, stroke, egui::StrokeKind::Inside);
+                let tip = center - egui::vec2(0.0, 3.0);
+                ui.painter().line_segment([center + egui::vec2(0.0, 4.0), tip], stroke);
+                for dx in [-3.0, 3.0] {
+                    ui.painter().line_segment([tip, tip + egui::vec2(dx, 3.0)], stroke);
+                }
+                if enabled && share.clicked() {
+                    self.toggle_presentation_window();
+                }
 
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
@@ -1718,8 +1775,8 @@ impl ShellHopperApp {
                         });
                     let new_tab_response =
                         theme::new_tab_button(ui).on_hover_text("New local terminal");
-                    controls_right = new_tab_response.rect.right();
                     new_tab = new_tab_response.clicked();
+                    controls_right = new_tab_response.rect.right();
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(version) = &update_version {
                             let label = format!("Update to v{version}");
@@ -2144,6 +2201,9 @@ impl ShellHopperApp {
         let saved_commands = self.config.saved_commands.clone();
         let word_wrap = !self.config.no_word_wrap;
         let mut file_drop_target = self.file_drop_target;
+        let presentation_open = self.presentation_open;
+        let mut toggle_presentation = false;
+        let mut presentation_settings = false;
         let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) else {
             return;
         };
@@ -2171,8 +2231,7 @@ impl ShellHopperApp {
             .floor()
             .clamp(20.0, u16::MAX as f32) as u16;
         let show_command_editor = session.editor_active();
-        let pane_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(row_height * 2.0);
-        let terminal_height = pane_height;
+        let terminal_height = ui.available_rect_before_wrap().intersect(ui.clip_rect()).height();
         let rows = (terminal_height / row_height)
             .floor()
             .clamp(2.0, u16::MAX as f32) as u16;
@@ -2204,6 +2263,7 @@ impl ShellHopperApp {
                 session.command_input_mut(),
                 editor_indent,
                 editor_wrap_width,
+                TerminalMetrics::DEFAULT,
             );
             let height = ctx.fonts_mut(|fonts| fonts.layout_job(job)).size().y;
             editor_rows = (height / row_height).ceil().clamp(1.0, f32::from(rows)) as u16;
@@ -2226,6 +2286,7 @@ impl ShellHopperApp {
             history_rows,
             selection.as_ref(),
             !show_command_editor,
+            TerminalMetrics::DEFAULT,
         );
         let screen = session.screen();
         let application_cursor = screen.application_cursor();
@@ -2629,6 +2690,22 @@ impl ShellHopperApp {
                             ui.close();
                         }
                         ui.separator();
+                        if ui
+                            .button(if presentation_open {
+                                "Close presentation window"
+                            } else {
+                                "Open presentation window"
+                            })
+                            .clicked()
+                        {
+                            toggle_presentation = true;
+                            ui.close();
+                        }
+                        if ui.button("Presentation settings…").clicked() {
+                            presentation_settings = true;
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui.button(close_label).clicked() {
                             close = true;
                             ui.close();
@@ -2746,6 +2823,7 @@ impl ShellHopperApp {
                     session.command_input_mut().as_str(),
                     editor_indent,
                     editor_wrap_width,
+                    TerminalMetrics::DEFAULT,
                 );
                 let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
                 let cursor = egui::TextEdit::load_state(ctx, editor_id)
@@ -2843,7 +2921,12 @@ impl ShellHopperApp {
                     ),
                 );
                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _: f32| {
-                    let job = command_editor_job(text.as_str(), editor_indent, editor_wrap_width);
+                    let job = command_editor_job(
+                        text.as_str(),
+                        editor_indent,
+                        editor_wrap_width,
+                        TerminalMetrics::DEFAULT,
+                    );
                     ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
                 };
                 let text_edit = egui::TextEdit::multiline(session.command_input_mut())
@@ -3023,6 +3106,266 @@ impl ShellHopperApp {
         }
         if manage_saved_commands {
             self.saved_commands_editor = Some(saved_commands);
+        }
+        if toggle_presentation {
+            self.toggle_presentation_window();
+        }
+        if presentation_settings {
+            self.presentation_settings_open = true;
+        }
+    }
+
+    fn save_presentation_geometry(&mut self) {
+        let Some((origin, extent)) = self.presentation_geometry else {
+            return;
+        };
+        let position = Some([origin.x.round() as i32, origin.y.round() as i32]);
+        let size = Some([extent.x.round() as u32, extent.y.round() as u32]);
+        if self.config.presentation_position != position || self.config.presentation_size != size {
+            self.config.presentation_position = position;
+            self.config.presentation_size = size;
+            self.save_config();
+        }
+    }
+
+    fn toggle_presentation_window(&mut self) {
+        if self.presentation_open {
+            self.save_presentation_geometry();
+            self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+        self.presentation_geometry = None;
+        self.presentation_open = !self.presentation_open;
+    }
+
+    fn presentation_window(&mut self, ctx: &egui::Context) {
+        if !self.presentation_open {
+            return;
+        }
+        let active = self.active_session;
+        let settings = self.config.presentation.clone();
+        let mut font_size = settings.font_size;
+        let mut mask_keys = settings.mask_keys;
+        let mut mask_paths = settings.mask_paths;
+        let mut hide_host_details = settings.hide_host_details;
+        let [red, green, blue] = settings.text_color;
+        let foreground = Color32::from_rgb(red, green, blue);
+        let [red, green, blue] = settings.background_color;
+        let background = Color32::from_rgb(red, green, blue);
+        let mut session = self
+            .sessions
+            .iter_mut()
+            .find(|session| Some(session.id) == active);
+        let typed = session
+            .as_deref_mut()
+            .filter(|session| settings.show_typing && session.editor_active())
+            .map(|session| session.command_input_mut().clone())
+            .filter(|text| !text.is_empty());
+        let session = session.as_deref();
+        let mut close = false;
+        let [width, height] = self.config.presentation_size.unwrap_or([1280, 720]);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("Presentation Mode")
+            .with_inner_size([width.max(480) as f32, height.max(270) as f32])
+            .with_min_inner_size([480.0, 270.0]);
+        if let Some([x, y]) = self.config.presentation_position {
+            builder = builder.with_position([x as f32, y as f32]);
+        }
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("shellhopper-presentation"),
+            builder,
+            |root, _class| {
+                let ctx = root.ctx().clone();
+                // egui's default shortcuts change zoom for every viewport.
+                use egui::gui_zoom::kb_shortcuts::*;
+                ctx.input_mut(|input| {
+                    let size = font_size.unwrap_or(TERM_FONT_SIZE as u8);
+                    if input.consume_shortcut(&ZOOM_RESET) {
+                        font_size = None;
+                    } else if input.consume_shortcut(&ZOOM_IN) || input.consume_shortcut(&ZOOM_IN_SECONDARY) {
+                        font_size = Some(size.saturating_add(2).min(96));
+                    } else if input.consume_shortcut(&ZOOM_OUT) {
+                        font_size = Some(size.saturating_sub(2).max(6));
+                    }
+                });
+                if let Some(geometry) = ctx.input(|input| {
+                    let viewport = input.viewport();
+                    let outer = viewport.outer_rect?;
+                    let inner = viewport.inner_rect?;
+                    (outer.is_finite() && inner.is_finite() && inner.is_positive()
+                        && viewport.minimized != Some(true)
+                        && viewport.fullscreen != Some(true))
+                        .then_some((outer.min, inner.size()))
+                }) {
+                    self.presentation_geometry = Some(geometry);
+                }
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    close = true;
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(background)
+                            .inner_margin(f32::from(settings.padding)),
+                    )
+                    .show(root, |ui| {
+                        let area = ui.available_rect_before_wrap();
+                        let drag = ui.interact(
+                            area,
+                            egui::Id::new("presentation-drag"),
+                            Sense::click_and_drag(),
+                        );
+                        drag.context_menu(|ui| {
+                            ui.label("Presentation font size");
+                            presentation_font_options(ui, &mut font_size);
+                            ui.separator();
+                            ui.checkbox(&mut mask_keys, "Mask keys with ***");
+                            ui.checkbox(&mut mask_paths, "Mask paths with .../...");
+                            ui.checkbox(&mut hide_host_details, "Hide host details");
+                        });
+                        if drag.drag_started_by(egui::PointerButton::Primary) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        let Some(session) = session else {
+                            ui.painter().text(
+                                area.center(),
+                                Align2::CENTER_CENTER,
+                                "No terminal to present",
+                                FontId::proportional(18.0),
+                                MUTED,
+                            );
+                            return;
+                        };
+                        let screen = session.screen();
+                        let lines = f32::from(screen.size().0);
+                        let scale = font_size.map_or_else(
+                            || (area.height() / (lines * TERM_LINE_HEIGHT)).min(8.0),
+                            |size| f32::from(size.clamp(1, 96)) / TERM_FONT_SIZE,
+                        );
+                        let mut metrics = TerminalMetrics {
+                            font_size: TERM_FONT_SIZE * scale,
+                            line_height: TERM_LINE_HEIGHT * scale,
+                            letter_spacing: 0.0,
+                            foreground,
+                            background,
+                        };
+                        if settings.fill_window {
+                            let cell = ctx.fonts_mut(|fonts| {
+                                fonts.glyph_width(&FontId::monospace(metrics.font_size), 'M')
+                            });
+                            let columns = (area.width() / cell).floor().max(1.0);
+                            metrics.letter_spacing = (area.width() / columns - cell).max(0.0);
+                            metrics.line_height = (area.height() / lines).max(metrics.line_height);
+                        }
+                        // Text layout rounds each row to a physical pixel. Round down
+                        // here so that rounding cannot push the last row out of view.
+                        let pixels_per_point = ctx.pixels_per_point();
+                        metrics.line_height =
+                            (metrics.line_height * pixels_per_point).floor() / pixels_per_point;
+                        if metrics.line_height <= 0.0 {
+                            return;
+                        }
+                        let (job, cursor) =
+                            presentation_layout(screen, typed.as_deref(), area.width(), metrics);
+                        let (job, cursor) = crate::presentation_mask::apply(job, cursor, mask_keys, mask_paths,
+                            hide_host_details.then_some((&mut self.presentation_identities, self.config.hosts.as_slice())));
+                        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+                        let scroll = cursor.map_or(0.0, |index| {
+                            let caret = galley.pos_from_cursor(egui::text::CCursor::new(index));
+                            (caret.bottom() - area.height()).max(0.0)
+                        });
+                        ui.painter().with_clip_rect(area).galley(
+                            area.min - egui::vec2(0.0, scroll),
+                            galley,
+                            foreground,
+                        );
+                    });
+            },
+        );
+        if font_size != settings.font_size || mask_keys != settings.mask_keys || mask_paths != settings.mask_paths || hide_host_details != settings.hide_host_details {
+            self.config.presentation.hide_host_details = hide_host_details;
+            self.config.presentation.mask_paths = mask_paths;
+            self.config.presentation.mask_keys = mask_keys;
+            self.config.presentation.font_size = font_size;
+            self.save_config();
+        }
+        if close {
+            self.toggle_presentation_window();
+        }
+    }
+
+    fn presentation_settings(&mut self, root: &mut egui::Ui) {
+        if !self.presentation_settings_open {
+            return;
+        }
+        let before = self.config.presentation.clone();
+        let mut done = false;
+        let mut toggle = false;
+        let open = self.presentation_open;
+        let settings = &mut self.config.presentation;
+        egui::Window::new("Presentation Mode")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([360.0, 300.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(root, |ui| {
+                egui::Grid::new("presentation-settings")
+                    .num_columns(2)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label("Font size");
+                        egui::ComboBox::from_id_salt("presentation-font-size")
+                            .selected_text(presentation_font_label(settings.font_size))
+                            .show_ui(ui, |ui| presentation_font_options(ui, &mut settings.font_size));
+                        ui.end_row();
+                        ui.label("Text color");
+                        ui.color_edit_button_srgb(&mut settings.text_color);
+                        ui.end_row();
+                        ui.label("Background color");
+                        ui.color_edit_button_srgb(&mut settings.background_color);
+                        ui.end_row();
+                        ui.label("Padding");
+                        ui.add(egui::Slider::new(&mut settings.padding, 0..=64));
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                ui.checkbox(&mut settings.fill_window, "Stretch text edge to edge");
+                ui.checkbox(&mut settings.mask_keys, "Mask keys with ***");
+                ui.checkbox(&mut settings.mask_paths, "Mask paths with .../...");
+                ui.checkbox(&mut settings.hide_host_details, "Hide host details")
+                    .on_hover_text("Replace usernames, hostnames, and IP addresses with stable labels");
+                ui.checkbox(&mut settings.show_typing, "Show commands as I type them");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(theme::secondary_button(
+                            if open { "Close window" } else { "Open window" },
+                            110.0,
+                        ))
+                        .clicked()
+                    {
+                        toggle = true;
+                    }
+                    if ui.add(theme::secondary_button("Defaults", 80.0)).clicked() {
+                        *settings = Default::default();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(theme::primary_button("Done", 72.0)).clicked() {
+                            done = true;
+                        }
+                    });
+                });
+            });
+        if toggle {
+            self.toggle_presentation_window();
+        }
+        if done {
+            self.presentation_settings_open = false;
+        }
+        let pointer_down = root.ctx().input(|input| input.pointer.any_down());
+        self.presentation_settings_dirty |= self.config.presentation != before;
+        if self.presentation_settings_dirty && (!pointer_down || done) {
+            self.presentation_settings_dirty = false;
+            self.save_config();
         }
     }
 
@@ -3674,7 +4017,11 @@ impl eframe::App for ShellHopperApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_quit_confirmation = true;
         }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.save_presentation_geometry();
+        }
         self.shortcuts(&ctx);
+        self.presentation_window(&ctx);
         self.sidebar(root);
         self.tab_bar(root);
         egui::CentralPanel::default()
@@ -3692,6 +4039,16 @@ impl eframe::App for ShellHopperApp {
         self.host_editor(root);
         self.group_editor(root);
         self.saved_commands_editor(root);
+        self.presentation_settings(root);
+        if self.presentation_open {
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("sharing-outline"));
+            ctx.layer_painter(layer).rect_stroke(
+                ctx.viewport_rect(),
+                10,
+                Stroke::new(2.0, RED),
+                egui::StrokeKind::Inside,
+            );
+        }
 
         if let Some(pending) = &self.pending_upload {
             let mut upload = false;
@@ -4202,15 +4559,21 @@ fn command_editor_column(screen: &vt100::Screen, cols: u16) -> u16 {
 }
 
 /// Lays the command out on the terminal's own grid, wrapping at the pane edge.
-fn command_editor_job(text: &str, indent: f32, wrap_width: f32) -> LayoutJob {
+fn command_editor_job(
+    text: &str,
+    indent: f32,
+    wrap_width: f32,
+    metrics: TerminalMetrics,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.append(
         text,
         indent,
         TextFormat {
-            font_id: FontId::monospace(TERM_FONT_SIZE),
-            color: Color32::from_rgb(225, 228, 238),
-            line_height: Some(TERM_LINE_HEIGHT),
+            font_id: FontId::monospace(metrics.font_size),
+            extra_letter_spacing: metrics.letter_spacing,
+            color: metrics.foreground,
+            line_height: Some(metrics.line_height),
             ..Default::default()
         },
     );
@@ -4540,13 +4903,155 @@ fn control_byte(key: Key) -> Option<u8> {
     Some(letter & 0x1f)
 }
 
+fn presentation_font_label(size: Option<u8>) -> String {
+    size.map_or_else(|| "Fit window".to_owned(), |pt| format!("{pt} pt"))
+}
+
+fn presentation_font_options(ui: &mut egui::Ui, selected: &mut Option<u8>) {
+    for size in [None, Some(12), Some(16), Some(20), Some(24), Some(32), Some(48)] {
+        if ui.selectable_value(selected, size, presentation_font_label(size)).clicked() {
+            ui.close();
+        }
+    }
+}
+
+fn terminal_cell_format(
+    cell: &vt100::Cell,
+    metrics: TerminalMetrics,
+    cursor_here: bool,
+    matched: bool,
+    selected: bool,
+) -> TextFormat {
+    let mut foreground = terminal_color(cell.fgcolor(), metrics.foreground);
+    let mut background = terminal_color(cell.bgcolor(), metrics.background);
+    if cell.bold() {
+        foreground = brighten(foreground);
+    } else if cell.dim() {
+        foreground = dim(foreground);
+    }
+    if cell.inverse() || cursor_here {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    if matched {
+        foreground = Color32::from_rgb(26, 29, 36);
+        background = Color32::from_rgb(234, 190, 78);
+    }
+    if selected {
+        foreground = Color32::WHITE;
+        background = Color32::from_rgb(50, 96, 151);
+    }
+
+    TextFormat {
+        font_id: FontId::monospace(metrics.font_size),
+        extra_letter_spacing: metrics.letter_spacing,
+        line_height: Some(metrics.line_height),
+        color: foreground,
+        background,
+        italics: cell.italic(),
+        underline: if cell.underline() {
+            Stroke::new(1.0, foreground)
+        } else {
+            Stroke::NONE
+        },
+        ..Default::default()
+    }
+}
+
+/// Join soft-wrapped PTY rows before laying out text in the presentation viewport.
+fn presentation_layout(
+    screen: &vt100::Screen,
+    typed: Option<&str>,
+    width: f32,
+    metrics: TerminalMetrics,
+) -> (LayoutJob, Option<usize>) {
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let live = screen.scrollback() == 0;
+    let editor = typed.filter(|_| live);
+    let cursor_col = if editor.is_some() {
+        command_editor_column(screen, cols)
+    } else {
+        cursor_col
+    };
+    let mut job = command_editor_job("", 0.0, width, metrics);
+    job.keep_trailing_whitespace = true;
+    let plain = job.sections[0].format.clone();
+    let mut run = String::new();
+    let mut format = None;
+    let mut chars = 0;
+    let mut cursor = None;
+    for row in 0..rows {
+        let continued = screen.row_wrapped(row) && !screen.alternate_screen();
+        let mut end = if continued {
+            cols
+        } else {
+            (0..cols)
+                .rev()
+                .find(|&col| {
+                    screen.cell(row, col).is_some_and(|cell| {
+                        cell.has_contents()
+                            || cell.bgcolor() != vt100::Color::Default
+                            || cell.inverse()
+                    })
+                })
+                .map_or(0, |col| col + 1)
+        };
+        if live && row == cursor_row {
+            end = if editor.is_some() {
+                cursor_col
+            } else {
+                end.max(cursor_col.saturating_add(1))
+            };
+        }
+        for col in 0..end.min(cols) {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let here = live && (row, col) == (cursor_row, cursor_col);
+            if here {
+                cursor = Some(chars);
+            }
+            let text = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            let style =
+                terminal_cell_format(cell, metrics, here && !screen.hide_cursor(), false, false);
+            append_terminal_run(&mut job, &mut run, &mut format, text, style);
+            chars += text.chars().count();
+        }
+        if row == cursor_row
+            && let Some(text) = editor
+        {
+            append_terminal_run(&mut job, &mut run, &mut format, text, plain.clone());
+            chars += text.chars().count();
+            cursor = Some(chars);
+        }
+        if row + 1 < rows && !continued {
+            append_terminal_run(&mut job, &mut run, &mut format, "\n", plain.clone());
+            chars += 1;
+        }
+    }
+    if let Some(format) = format {
+        job.append(&run, 0.0, format);
+    }
+    (job, cursor)
+}
+
 fn terminal_layout(
     screen: &vt100::Screen,
     search: Option<&str>,
     history_rows: usize,
     selection: Option<&TerminalSelection>,
     show_cursor: bool,
+    metrics: TerminalMetrics,
 ) -> LayoutJob {
+    let font_size = metrics.font_size;
+    let line_height = metrics.line_height;
     let (rows, cols) = screen.size();
     let cursor = screen.cursor_position();
     let mut job = LayoutJob::default();
@@ -4572,44 +5077,15 @@ fn terminal_layout(
                 && screen.scrollback() == 0
                 && !screen.hide_cursor()
                 && cursor == (row, col);
-            let mut foreground = terminal_color(cell.fgcolor(), Color32::from_rgb(225, 228, 238));
-            let mut background = terminal_color(cell.bgcolor(), TERMINAL);
-            if cell.bold() {
-                foreground = brighten(foreground);
-            } else if cell.dim() {
-                foreground = dim(foreground);
-            }
-            if cell.inverse() || cursor_here {
-                std::mem::swap(&mut foreground, &mut background);
-            }
-            if search_matches
-                .get(usize::from(col))
-                .copied()
-                .unwrap_or(false)
-            {
-                foreground = Color32::from_rgb(26, 29, 36);
-                background = Color32::from_rgb(234, 190, 78);
-            }
-            if selection
-                .is_some_and(|selection| selection.contains(first_row + usize::from(row), col))
-            {
-                foreground = Color32::WHITE;
-                background = Color32::from_rgb(50, 96, 151);
-            }
-
-            let format = TextFormat {
-                font_id: FontId::monospace(TERM_FONT_SIZE),
-                line_height: Some(TERM_LINE_HEIGHT),
-                color: foreground,
-                background,
-                italics: cell.italic(),
-                underline: if cell.underline() {
-                    Stroke::new(1.0, foreground)
-                } else {
-                    Stroke::NONE
-                },
-                ..Default::default()
-            };
+            let format = terminal_cell_format(
+                cell,
+                metrics,
+                cursor_here,
+                search_matches.get(usize::from(col)).copied().unwrap_or(false),
+                selection.is_some_and(|selection| {
+                    selection.contains(first_row + usize::from(row), col)
+                }),
+            );
             let text = if cell.contents().is_empty() {
                 " "
             } else {
@@ -4624,10 +5100,10 @@ fn terminal_layout(
                 &mut run_format,
                 "\n",
                 TextFormat {
-                    font_id: FontId::monospace(TERM_FONT_SIZE),
-                    line_height: Some(TERM_LINE_HEIGHT),
-                    color: Color32::from_rgb(225, 228, 238),
-                    background: TERMINAL,
+                    font_id: FontId::monospace(font_size),
+                    line_height: Some(line_height),
+                    color: metrics.foreground,
+                    background: metrics.background,
                     ..Default::default()
                 },
             );
@@ -4899,7 +5375,8 @@ mod terminal_color_tests {
             };
             let mut output = ctx.run_ui(input, |ui| {
                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _: f32| {
-                    let job = command_editor_job(text.as_str(), 40.0, 2000.0);
+                    let job =
+                        command_editor_job(text.as_str(), 40.0, 2000.0, TerminalMetrics::DEFAULT);
                     ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
                 };
                 let editor = ui.add(
@@ -4915,7 +5392,7 @@ mod terminal_color_tests {
 
         assert_eq!(text, pasted);
         let layout = |text: &str, indent: f32, width: f32| {
-            let job = command_editor_job(text, indent, width);
+            let job = command_editor_job(text, indent, width, TerminalMetrics::DEFAULT);
             ctx.fonts_mut(|fonts| fonts.layout_job(job))
         };
         assert_eq!(layout(&text, 40.0, 2000.0).size().y, 3.0 * TERM_LINE_HEIGHT);

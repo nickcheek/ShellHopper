@@ -69,7 +69,7 @@ _shellhopper_load_history() {
   events=( ${(onk)history} )
   # Send the newest COMMAND_HISTORY_LIMIT entries oldest first, before Prompt.
   local -i offset=$(( ${#events} > 1000 ? ${#events} - 1000 : 0 ))
-  for event in "${events[@]:offset}"; do
+  for event in "${events[@]:$offset}"; do
     _shellhopper_record_command "${history[$event]}"
   done
 }

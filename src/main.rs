@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod presentation_mask;
 #[cfg(target_os = "macos")]
 mod menu_bar;
 mod terminal;
